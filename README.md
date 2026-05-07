@@ -10,6 +10,13 @@ When Caddy obtains or renews a certificate, it emits a `cert_obtained` event. Th
 
 No cron jobs, no polling, no external scripts. Just add the plugin to your Caddy build and configure it in your Caddyfile.
 
+If FortiGate is unreachable or the API call fails, the plugin logs the error and exits cleanly &mdash; Caddy's event pipeline keeps running and the certificate renewal still succeeds.
+
+## Requirements
+
+- Caddy v2.11.x or newer
+- A FortiGate running FortiOS 7.x with REST API enabled
+
 ## Installation
 
 Build Caddy with this plugin using [xcaddy](https://github.com/caddyserver/xcaddy):
@@ -41,17 +48,27 @@ xcaddy build --with github.com/jonarihen/caddy-forticertsync
             vdom root
             insecure_skip_verify
 
-            cert aaris_tech {
-                domains *.aaris.tech aaris.tech
+            cert example_com {
+                domains *.example.com example.com
             }
         }
     }
 }
 
-aaris.tech, *.aaris.tech {
+example.com, *.example.com {
     # your normal Caddy config
 }
 ```
+
+### Configuration options
+
+| Option | Required | Description |
+|---|---|---|
+| `fortigate_url` | yes | Base URL of the FortiGate admin interface, including port (e.g. `https://192.168.1.1:4443`). |
+| `api_token` | yes | FortiGate REST API bearer token. Use `{env.VAR}` to load it from an environment variable &mdash; never paste the token literally. |
+| `vdom` | no | Target VDOM name. Omit if VDOMs are disabled. |
+| `insecure_skip_verify` | no | Disable TLS verification when talking to FortiGate. Common in homelabs that use a self-signed admin cert. |
+| `cert <name> { domains ... }` | yes (≥1) | Maps a FortiGate certificate slot name to one or more domain identifiers. Supports exact (`example.com`) and wildcard (`*.example.com`) matching. Repeat the block for multiple certs. |
 
 ## JSON Configuration
 
@@ -71,8 +88,8 @@ aaris.tech, *.aaris.tech {
               "insecure_skip_verify": true,
               "certificates": [
                 {
-                  "name": "aaris_tech",
-                  "domains": ["*.aaris.tech", "aaris.tech"]
+                  "name": "example_com",
+                  "domains": ["*.example.com", "example.com"]
                 }
               ]
             }
@@ -86,7 +103,7 @@ aaris.tech, *.aaris.tech {
 
 ## Certificate Naming
 
-Certificates are uploaded to FortiGate with a date-suffixed name to avoid in-place update issues. For example, a cert mapping with name `aaris_tech` will be uploaded as `aaris_tech_07052026` (format: `ddMMyyyy`). When a newer cert is synced, the old one is automatically replaced and cleaned up.
+Certificates are uploaded to FortiGate with a date-suffixed name to avoid in-place update issues. For example, a cert mapping with name `example_com` will be uploaded as `example_com_07052026` (format: `ddMMyyyy`). When a newer cert is synced, the old one is automatically replaced and any FortiGate objects that referenced it are rebound. The old cert is only deleted once zero references remain &mdash; rebind failures leave it in place so nothing breaks.
 
 ## Troubleshooting
 

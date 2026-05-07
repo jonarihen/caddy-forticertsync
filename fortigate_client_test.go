@@ -262,9 +262,9 @@ func TestUpdateCertReference(t *testing.T) {
 func TestGetCertificateByPattern(t *testing.T) {
 	body := `{
 		"results": [
-			{"name":"aaris_tech","valid_from":1600000000,"valid_to":1700000000},
-			{"name":"aaris_tech_07052026","valid_from":1750000000,"valid_to":1800000000},
-			{"name":"aaris_tech_01012025","valid_from":1700000000,"valid_to":1750000000},
+			{"name":"example_com","valid_from":1600000000,"valid_to":1700000000},
+			{"name":"example_com_07052026","valid_from":1750000000,"valid_to":1800000000},
+			{"name":"example_com_01012025","valid_from":1700000000,"valid_to":1750000000},
 			{"name":"unrelated_cert","valid_from":1900000000,"valid_to":2000000000}
 		]
 	}`
@@ -275,15 +275,15 @@ func TestGetCertificateByPattern(t *testing.T) {
 
 	c := newTestClient(t, srv, "")
 
-	got, err := c.GetCertificateByPattern(context.Background(), "aaris_tech")
+	got, err := c.GetCertificateByPattern(context.Background(), "example_com")
 	if err != nil {
 		t.Fatalf("GetCertificateByPattern: %v", err)
 	}
 	if got == nil {
 		t.Fatal("got nil, expected match")
 	}
-	if got.Name != "aaris_tech_07052026" {
-		t.Errorf("got name = %q, want aaris_tech_07052026 (newest matching)", got.Name)
+	if got.Name != "example_com_07052026" {
+		t.Errorf("got name = %q, want example_com_07052026 (newest matching)", got.Name)
 	}
 
 	got, err = c.GetCertificateByPattern(context.Background(), "no_match_pattern")

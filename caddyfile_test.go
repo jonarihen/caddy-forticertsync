@@ -21,11 +21,11 @@ func TestUnmarshalCaddyfile_Full(t *testing.T) {
 		api_token sometoken
 		vdom root
 		insecure_skip_verify
-		cert aaris_tech {
-			domains *.aaris.tech aaris.tech
+		cert example_com {
+			domains *.example.com example.com
 		}
 		cert vpn_cert {
-			domains vpn.example.com
+			domains vpn.example.org
 		}
 	}`
 	h, err := parse(t, input)
@@ -47,7 +47,7 @@ func TestUnmarshalCaddyfile_Full(t *testing.T) {
 	if len(h.Certificates) != 2 {
 		t.Fatalf("Certificates len = %d, want 2", len(h.Certificates))
 	}
-	if h.Certificates[0].Name != "aaris_tech" {
+	if h.Certificates[0].Name != "example_com" {
 		t.Errorf("first cert name = %q", h.Certificates[0].Name)
 	}
 	if len(h.Certificates[0].Domains) != 2 {

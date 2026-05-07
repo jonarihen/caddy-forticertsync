@@ -49,12 +49,12 @@ type Handler struct {
 
 // CertMapping maps a FortiGate certificate slot to one or more domain identifiers.
 type CertMapping struct {
-	// Name is the base certificate name on FortiGate (e.g., "aaris_tech").
+	// Name is the base certificate name on FortiGate (e.g., "example_com").
 	// New certificates will be uploaded as "{name}_{ddMMyyyy}".
 	Name string `json:"name"`
 
 	// Domains lists the domain identifiers to match against the event's identifier.
-	// Supports exact match and wildcard (e.g., "*.aaris.tech").
+	// Supports exact match and wildcard (e.g., "*.example.com").
 	// If empty, matches all domains.
 	Domains []string `json:"domains,omitempty"`
 }
