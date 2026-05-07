@@ -123,17 +123,28 @@ func (h *Handler) Handle(ctx context.Context, e caddyevents.Event) error {
 	h.logger.Info("received cert_obtained event",
 		zap.String("identifier", identifier))
 
-	// Read cert + key PEM from disk
+	// Read cert + key PEM from disk. Failures here are logged and swallowed:
+	// returning an error from a Caddy event handler can block other handlers
+	// registered for the same event from running, and a transient read failure
+	// (or non-filesystem storage backend) should not derail Caddy's pipeline.
 	certPEM, err := os.ReadFile(certPath)
 	if err != nil {
-		return fmt.Errorf("reading certificate file: %w", err)
+		h.logger.Error("failed to read certificate file, skipping FortiGate sync",
+			zap.String("cert_path", certPath),
+			zap.Error(err))
+		return nil
 	}
 	keyPEM, err := os.ReadFile(keyPath)
 	if err != nil {
-		return fmt.Errorf("reading private key file: %w", err)
+		h.logger.Error("failed to read private key file, skipping FortiGate sync",
+			zap.String("key_path", keyPath),
+			zap.Error(err))
+		return nil
 	}
 
-	// Process each matching cert mapping
+	// Process each matching cert mapping. Per-mapping sync failures are logged
+	// but never returned: a FortiGate being unreachable must not block other
+	// Caddy event handlers, and one mapping failing should not skip the rest.
 	for _, mapping := range h.Certificates {
 		if !matchesDomain(identifier, mapping.Domains) {
 			continue
@@ -148,7 +159,6 @@ func (h *Handler) Handle(ctx context.Context, e caddyevents.Event) error {
 				zap.String("identifier", identifier),
 				zap.String("mapping_name", mapping.Name),
 				zap.Error(err))
-			return err
 		}
 	}
 
