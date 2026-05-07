@@ -106,7 +106,7 @@ func (h *Handler) Validate() error {
 // storage backends (consul, vault, etc.), the handler would need to access
 // Caddy's storage interface instead — this implementation assumes filesystem
 // storage, which is the default and most common configuration.
-func (h *Handler) Handle(ctx context.Context, e caddyevents.Event) error {
+func (h *Handler) Handle(ctx context.Context, e caddy.Event) error {
 	// Extract event metadata
 	identifier, _ := e.Data["identifier"].(string)
 	certPath, _ := e.Data["certificate_path"].(string)
