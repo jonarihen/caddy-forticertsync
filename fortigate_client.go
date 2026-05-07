@@ -263,17 +263,25 @@ func parseFortiDate(raw json.RawMessage) (time.Time, error) {
 }
 
 // ImportCertificate uploads a new certificate and private key to FortiGate.
+//
+// The payload sends full PEM content (including BEGIN/END headers and
+// newlines) as file_content / key_file_content. Some FortiOS versions
+// reportedly accept only the raw base64 body without the PEM armor — if
+// import fails with a malformed-input style error, switch to passing
+// stripPEMHeaders(certPEM) and stripPEMHeaders(keyPEM) instead.
 func (c *FortiGateClient) ImportCertificate(ctx context.Context, certName string, certPEM, keyPEM []byte) error {
 	apiURL := c.buildURL("api/v2/monitor/vpn-certificate/local/import")
 
+	scope := "global"
+	if c.vdom != "" {
+		scope = "vdom"
+	}
 	payload := map[string]string{
 		"type":             "regular",
 		"certname":         certName,
 		"file_content":     string(certPEM),
 		"key_file_content": string(keyPEM),
-	}
-	if c.vdom != "" {
-		payload["scope"] = "vdom"
+		"scope":            scope,
 	}
 
 	body, statusCode, err := c.doRequest(ctx, http.MethodPost, apiURL, payload)
@@ -395,6 +403,21 @@ func findRefsInList(body []byte, ep certRefEndpoint, certName string) []CertRefe
 		}
 	}
 	return refs
+}
+
+// stripPEMHeaders returns the raw base64 body of a PEM block with all
+// "-----BEGIN ...-----" / "-----END ...-----" lines and whitespace removed.
+// Reserved for use if a FortiOS version rejects full-PEM imports.
+func stripPEMHeaders(pemData []byte) string {
+	var b strings.Builder
+	for _, line := range strings.Split(string(pemData), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "-----") {
+			continue
+		}
+		b.WriteString(line)
+	}
+	return b.String()
 }
 
 // findRefsInSingleton parses a FortiGate CMDB singleton response and checks if it references the cert.
