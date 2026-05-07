@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -173,20 +174,19 @@ func (c *FortiGateClient) ListCertificates(ctx context.Context) ([]FortiCert, er
 		return nil, fmt.Errorf("list certificates returned status %d: %s", statusCode, string(body))
 	}
 
-	// Parse FortiGate response
-	// TODO: Implement response parsing. FortiGate returns JSON with a "results" array.
-	// Each result contains fields like "name", "subject", "issuer", "valid_from", "valid_to", etc.
-	// The exact field names and date formats need to be verified against a real FortiGate response.
+	// FortiGate returns JSON with a "results" array. Date fields can be
+	// either Unix epoch seconds (number) or formatted strings depending on
+	// FortiOS version, so we use json.RawMessage and a flexible parser.
 	var result struct {
 		Results []struct {
-			Name      string `json:"name"`
-			Subject   string `json:"subject"`
-			Issuer    string `json:"issuer"`
-			ValidFrom string `json:"valid_from"` // Verify actual field name
-			ValidTo   string `json:"valid_to"`   // Verify actual field name
-			Serial    string `json:"serial_number"`
-			Source    string `json:"source"`
-			QRef     int    `json:"q_ref"`
+			Name      string          `json:"name"`
+			Subject   string          `json:"subject"`
+			Issuer    string          `json:"issuer"`
+			ValidFrom json.RawMessage `json:"valid_from"`
+			ValidTo   json.RawMessage `json:"valid_to"`
+			Serial    string          `json:"serial_number"`
+			Source    string          `json:"source"`
+			QRef      int             `json:"q_ref"`
 		} `json:"results"`
 	}
 
@@ -202,14 +202,64 @@ func (c *FortiGateClient) ListCertificates(ctx context.Context) ([]FortiCert, er
 			Issuer:  r.Issuer,
 			Serial:  r.Serial,
 			Source:  r.Source,
-			QRef:   r.QRef,
+			QRef:    r.QRef,
 		}
-		// TODO: Parse date fields. FortiGate may use epoch or a specific date format.
-		// Verify against actual API response and implement parsing.
+		if t, err := parseFortiDate(r.ValidFrom); err == nil {
+			cert.NotBefore = t
+		}
+		if t, err := parseFortiDate(r.ValidTo); err == nil {
+			cert.NotAfter = t
+		}
 		certs = append(certs, cert)
 	}
 
 	return certs, nil
+}
+
+// parseFortiDate parses a FortiGate date field which may be either a Unix
+// epoch (as a JSON number or a quoted numeric string) or a formatted date
+// string in one of several common FortiOS shapes.
+func parseFortiDate(raw json.RawMessage) (time.Time, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return time.Time{}, fmt.Errorf("empty date field")
+	}
+
+	// Try as a JSON number (epoch seconds)
+	var n int64
+	if err := json.Unmarshal(raw, &n); err == nil {
+		return time.Unix(n, 0).UTC(), nil
+	}
+
+	// Try as a quoted string
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return time.Time{}, fmt.Errorf("date field is neither number nor string: %s", string(raw))
+	}
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return time.Time{}, fmt.Errorf("empty date string")
+	}
+
+	// String containing only digits → epoch seconds
+	if epoch, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return time.Unix(epoch, 0).UTC(), nil
+	}
+
+	// Try common FortiOS date string formats
+	formats := []string{
+		time.RFC3339,
+		"2006-01-02 15:04:05 MST",
+		"2006-01-02 15:04:05",
+		"Jan 2 15:04:05 2006 MST",
+		"Jan _2 15:04:05 2006 GMT",
+		"Mon Jan _2 15:04:05 2006 MST",
+	}
+	for _, f := range formats {
+		if t, err := time.Parse(f, s); err == nil {
+			return t.UTC(), nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("unrecognized date format: %q", s)
 }
 
 // ImportCertificate uploads a new certificate and private key to FortiGate.
