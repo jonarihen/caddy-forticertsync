@@ -14,8 +14,8 @@ If FortiGate is unreachable or the API call fails, the plugin logs the error and
 
 ## Requirements
 
-- Caddy v2.11.x or newer
-- A FortiGate running FortiOS 7.x with REST API enabled
+- Caddy v2.11.x or newer, using the default file-system storage backend in its default data directory (the plugin reads cert/key files from `caddy.AppDataDir()`; non-default storage backends or a custom storage root are not yet supported &mdash; open an issue if you need this).
+- A FortiGate running FortiOS 7.x with REST API enabled (tested against 7.6.6).
 
 ## Installation
 
@@ -119,6 +119,7 @@ Common issues:
 - **401 Unauthorized:** Check your API token and trusted hosts on FortiGate
 - **Certificate not found:** Ensure the `cert` name matches what exists on FortiGate (check System > Certificates)
 - **Connection refused:** Verify `fortigate_url` includes the correct HTTPS port
+- **`failed to read certificate file`:** The plugin resolves cert/key paths against `caddy.AppDataDir()`. If you've configured a custom Caddy storage root, the resolved path won't exist &mdash; see Requirements above.
 
 ## Attribution
 
