@@ -264,11 +264,15 @@ func parseFortiDate(raw json.RawMessage) (time.Time, error) {
 
 // ImportCertificate uploads a new certificate and private key to FortiGate.
 //
-// The payload sends full PEM content (including BEGIN/END headers and
-// newlines) as file_content / key_file_content. Some FortiOS versions
-// reportedly accept only the raw base64 body without the PEM armor — if
-// import fails with a malformed-input style error, switch to passing
-// stripPEMHeaders(certPEM) and stripPEMHeaders(keyPEM) instead.
+// PEM payload format — most likely failure point on first real-world test.
+// The payload below sends full PEM content (BEGIN/END headers + newlines)
+// as file_content / key_file_content. The FortiOS 7.6 administration
+// guide documents file_content as a string field but does not pin down
+// whether the string must be raw base64 or armored PEM:
+//   https://docs.fortinet.com/document/fortigate/7.6.0/administration-guide/379103
+// Community reports indicate some FortiOS builds accept only the base64
+// body. If import fails with a malformed-input / decode error, replace
+// `string(certPEM)` with `stripPEMHeaders(certPEM)` (and same for keyPEM).
 func (c *FortiGateClient) ImportCertificate(ctx context.Context, certName string, certPEM, keyPEM []byte) error {
 	apiURL := c.buildURL("api/v2/monitor/vpn-certificate/local/import")
 
