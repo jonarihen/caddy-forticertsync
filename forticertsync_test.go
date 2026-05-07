@@ -8,6 +8,8 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"math/big"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -76,6 +78,52 @@ func TestParsePEMCertificate(t *testing.T) {
 			t.Error("expected error on garbage cert body")
 		}
 	})
+}
+
+func TestResolveStoragePath(t *testing.T) {
+	// Use filepath.Join in expected values so the test passes on both
+	// Unix (/var/lib/caddy/...) and Windows (C:\ProgramData\Caddy\...).
+	dataDir := filepath.Join(string(filepath.Separator)+"var", "lib", "caddy")
+	storageKey := "certificates/acme-v02.api.letsencrypt.org-directory/wildcard_.example.com/wildcard_.example.com.crt"
+	wantJoined := filepath.Join(dataDir, "certificates", "acme-v02.api.letsencrypt.org-directory", "wildcard_.example.com", "wildcard_.example.com.crt")
+
+	tests := []struct {
+		name       string
+		dataDir    string
+		storageKey string
+		want       string
+	}{
+		{
+			name:       "relative storage key joined to data dir",
+			dataDir:    dataDir,
+			storageKey: storageKey,
+			want:       wantJoined,
+		},
+		{
+			// os.TempDir() is absolute on every supported OS (Unix returns
+			// /tmp; Windows returns something like C:\Users\...\Temp), so
+			// joining a filename onto it gives a portable absolute path.
+			name:       "absolute path passes through unchanged",
+			dataDir:    dataDir,
+			storageKey: filepath.Join(os.TempDir(), "cert.pem"),
+			want:       filepath.Clean(filepath.Join(os.TempDir(), "cert.pem")),
+		},
+		{
+			name:       "empty data dir leaves relative key relative",
+			dataDir:    "",
+			storageKey: "certificates/foo/bar.crt",
+			want:       filepath.Join("certificates", "foo", "bar.crt"),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := resolveStoragePath(tt.dataDir, tt.storageKey)
+			if got != tt.want {
+				t.Errorf("resolveStoragePath(%q, %q) = %q, want %q",
+					tt.dataDir, tt.storageKey, got, tt.want)
+			}
+		})
+	}
 }
 
 func TestHandlerValidate(t *testing.T) {

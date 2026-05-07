@@ -111,15 +111,21 @@ func TestImportCertificate(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(t, srv, "root")
-	err := c.ImportCertificate(context.Background(), "mycert", []byte("CERTPEM"), []byte("KEYPEM"))
+	certPEM := []byte("-----BEGIN CERTIFICATE-----\nQUJDRA==\nRUZHSA==\n-----END CERTIFICATE-----\n")
+	keyPEM := []byte("-----BEGIN EC PRIVATE KEY-----\nS0VZQk9EWQ==\n-----END EC PRIVATE KEY-----\n")
+	err := c.ImportCertificate(context.Background(), "mycert", certPEM, keyPEM)
 	if err != nil {
 		t.Fatalf("ImportCertificate: %v", err)
 	}
 	if capturedPayload["certname"] != "mycert" {
 		t.Errorf("certname = %q", capturedPayload["certname"])
 	}
-	if capturedPayload["file_content"] != "CERTPEM" {
-		t.Errorf("file_content = %q", capturedPayload["file_content"])
+	// FortiOS 7.6.6 requires stripped base64 — no BEGIN/END armor, no newlines.
+	if capturedPayload["file_content"] != "QUJDRA==RUZHSA==" {
+		t.Errorf("file_content = %q, want stripped base64 body", capturedPayload["file_content"])
+	}
+	if capturedPayload["key_file_content"] != "S0VZQk9EWQ==" {
+		t.Errorf("key_file_content = %q, want stripped base64 body", capturedPayload["key_file_content"])
 	}
 	if capturedPayload["scope"] != "vdom" {
 		t.Errorf("scope = %q (vdom set, expected vdom)", capturedPayload["scope"])
@@ -138,12 +144,17 @@ func TestImportCertificate_GlobalScope(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(t, srv, "")
-	err := c.ImportCertificate(context.Background(), "mycert", []byte("CERTPEM"), []byte("KEYPEM"))
+	certPEM := []byte("-----BEGIN CERTIFICATE-----\nQUJDRA==\n-----END CERTIFICATE-----\n")
+	keyPEM := []byte("-----BEGIN EC PRIVATE KEY-----\nS0VZ\n-----END EC PRIVATE KEY-----\n")
+	err := c.ImportCertificate(context.Background(), "mycert", certPEM, keyPEM)
 	if err != nil {
 		t.Fatalf("ImportCertificate: %v", err)
 	}
 	if capturedPayload["scope"] != "global" {
 		t.Errorf("scope = %q, want global", capturedPayload["scope"])
+	}
+	if capturedPayload["file_content"] != "QUJDRA==" {
+		t.Errorf("file_content = %q, want stripped base64 body", capturedPayload["file_content"])
 	}
 }
 

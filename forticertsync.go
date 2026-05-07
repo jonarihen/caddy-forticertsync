@@ -8,6 +8,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -43,8 +44,9 @@ type Handler struct {
 	// admin certificates.
 	InsecureSkipVerify bool `json:"insecure_skip_verify,omitempty"`
 
-	logger *zap.Logger
-	client *FortiGateClient
+	logger  *zap.Logger
+	client  *FortiGateClient
+	dataDir string
 }
 
 // CertMapping maps a FortiGate certificate slot to one or more domain identifiers.
@@ -75,6 +77,11 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	repl := caddy.NewReplacer()
 	h.APIToken = repl.ReplaceAll(h.APIToken, "")
 
+	// cert_obtained event data carries storage keys (relative paths) rather
+	// than absolute filesystem paths, so we need Caddy's data dir to resolve
+	// them with filepath.Join in Handle().
+	h.dataDir = caddy.AppDataDir()
+
 	h.client = NewFortiGateClient(h.FortiGateURL, h.APIToken, h.VDOM, h.InsecureSkipVerify, h.logger)
 	return nil
 }
@@ -100,12 +107,13 @@ func (h *Handler) Validate() error {
 
 // Handle processes a cert_obtained event from Caddy.
 //
-// Note on event data: Caddy's cert_obtained event provides filesystem paths
-// in `certificate_path` and `private_key_path`. These are concrete paths
-// when Caddy is using the default filesystem storage. For non-filesystem
-// storage backends (consul, vault, etc.), the handler would need to access
-// Caddy's storage interface instead — this implementation assumes filesystem
-// storage, which is the default and most common configuration.
+// Note on event data: Caddy's cert_obtained event provides storage keys
+// (relative paths like "certificates/<issuer>/<name>/<name>.crt") in
+// `certificate_path` and `private_key_path`, not absolute filesystem
+// paths. We resolve them against caddy.AppDataDir() captured during
+// Provision, which assumes the default filesystem storage backend. For
+// non-filesystem storage (consul, vault, etc.), the handler would need
+// to access Caddy's storage interface instead.
 func (h *Handler) Handle(ctx context.Context, e caddy.Event) error {
 	// Extract event metadata
 	identifier, _ := e.Data["identifier"].(string)
@@ -123,21 +131,24 @@ func (h *Handler) Handle(ctx context.Context, e caddy.Event) error {
 	h.logger.Info("received cert_obtained event",
 		zap.String("identifier", identifier))
 
+	certFullPath := resolveStoragePath(h.dataDir, certPath)
+	keyFullPath := resolveStoragePath(h.dataDir, keyPath)
+
 	// Read cert + key PEM from disk. Failures here are logged and swallowed:
 	// returning an error from a Caddy event handler can block other handlers
 	// registered for the same event from running, and a transient read failure
 	// (or non-filesystem storage backend) should not derail Caddy's pipeline.
-	certPEM, err := os.ReadFile(certPath)
+	certPEM, err := os.ReadFile(certFullPath)
 	if err != nil {
 		h.logger.Error("failed to read certificate file, skipping FortiGate sync",
-			zap.String("cert_path", certPath),
+			zap.String("cert_path", certFullPath),
 			zap.Error(err))
 		return nil
 	}
-	keyPEM, err := os.ReadFile(keyPath)
+	keyPEM, err := os.ReadFile(keyFullPath)
 	if err != nil {
 		h.logger.Error("failed to read private key file, skipping FortiGate sync",
-			zap.String("key_path", keyPath),
+			zap.String("key_path", keyFullPath),
 			zap.Error(err))
 		return nil
 	}
@@ -230,6 +241,17 @@ func matchesDomain(identifier string, domains []string) bool {
 		}
 	}
 	return false
+}
+
+// resolveStoragePath joins a Caddy storage key (a relative path emitted by
+// the cert_obtained event) onto the configured data directory. If the key
+// is already absolute it is returned unchanged, which keeps the door open
+// for storage backends that emit absolute paths.
+func resolveStoragePath(dataDir, storageKey string) string {
+	if filepath.IsAbs(storageKey) {
+		return filepath.Clean(storageKey)
+	}
+	return filepath.Join(dataDir, storageKey)
 }
 
 // parsePEMCertificate decodes a PEM-encoded certificate and returns the parsed x509 cert.
