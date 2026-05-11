@@ -34,8 +34,10 @@ func newRebindMockServer(initialRefs int) *rebindMockServer {
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, `{"status":"success"}`)
 	})
-	mux.HandleFunc("/api/v2/monitor/vpn-certificate/local/clear", func(w http.ResponseWriter, r *http.Request) {
-		m.deleteCalls.Add(1)
+	mux.HandleFunc("/api/v2/cmdb/vpn.certificate/local/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			m.deleteCalls.Add(1)
+		}
 		w.WriteHeader(http.StatusOK)
 	})
 
@@ -137,8 +139,10 @@ func TestRebindCertificates_ReferencesRemainAfterRebind(t *testing.T) {
 		importCalls.Add(1)
 		w.WriteHeader(http.StatusOK)
 	})
-	mux.HandleFunc("/api/v2/monitor/vpn-certificate/local/clear", func(w http.ResponseWriter, r *http.Request) {
-		deleteCalls.Add(1)
+	mux.HandleFunc("/api/v2/cmdb/vpn.certificate/local/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			deleteCalls.Add(1)
+		}
 		w.WriteHeader(http.StatusOK)
 	})
 	// Always report the old cert as still bound, regardless of PUTs.

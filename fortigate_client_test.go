@@ -182,14 +182,11 @@ func TestImportCertificate_AlreadyExists(t *testing.T) {
 
 func TestDeleteCertificate(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			t.Errorf("method = %s", r.Method)
+		if r.Method != http.MethodDelete {
+			t.Errorf("method = %s, want DELETE", r.Method)
 		}
-		if r.URL.Query().Get("mkey") != "oldcert" {
-			t.Errorf("mkey = %q", r.URL.Query().Get("mkey"))
-		}
-		if !strings.Contains(r.URL.Path, "/monitor/vpn-certificate/local/clear") {
-			t.Errorf("path = %s", r.URL.Path)
+		if !strings.HasSuffix(r.URL.Path, "/api/v2/cmdb/vpn.certificate/local/oldcert") {
+			t.Errorf("path = %s, want suffix /api/v2/cmdb/vpn.certificate/local/oldcert", r.URL.Path)
 		}
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -248,15 +245,20 @@ func TestFindCertReferences(t *testing.T) {
 }
 
 func TestUpdateCertReference(t *testing.T) {
-	var capturedPayload map[string]string
+	var capturedPayload map[string]interface{}
 	var capturedPath string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPut {
-			t.Errorf("method = %s", r.Method)
+		switch r.Method {
+		case http.MethodGet:
+			// Single-cert string field (legacy/normal case).
+			_, _ = io.WriteString(w, `{"results":[{"name":"vip1","server-cert":"oldcert"}]}`)
+		case http.MethodPut:
+			capturedPath = r.URL.Path
+			_ = json.NewDecoder(r.Body).Decode(&capturedPayload)
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Errorf("unexpected method %s", r.Method)
 		}
-		capturedPath = r.URL.Path
-		_ = json.NewDecoder(r.Body).Decode(&capturedPayload)
-		w.WriteHeader(http.StatusOK)
 	}))
 	defer srv.Close()
 
@@ -273,8 +275,125 @@ func TestUpdateCertReference(t *testing.T) {
 	if !strings.HasSuffix(capturedPath, "/api/v2/cmdb/firewall/vip/vip1") {
 		t.Errorf("path = %s", capturedPath)
 	}
-	if capturedPayload["server-cert"] != "newcert" {
-		t.Errorf("server-cert payload = %q", capturedPayload["server-cert"])
+	if got, _ := capturedPayload["server-cert"].(string); got != "newcert" {
+		t.Errorf("server-cert payload = %v, want \"newcert\"", capturedPayload["server-cert"])
+	}
+}
+
+func TestUpdateCertReference_MultiValueString(t *testing.T) {
+	// FortiGate ssl-ssh-profile in "Protecting SSL Server" (replace) mode
+	// returns multiple cert names in a single space-separated string. The
+	// rebind must swap only the matching cert and preserve siblings.
+	var capturedPayload map[string]interface{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			_, _ = io.WriteString(w, `{"results":{"server-cert":"tm_lestang_dk_07052026 wildcard_aaris_tech_07052026 wildcard_aaris_wtf_07052026"}}`)
+		case http.MethodPut:
+			_ = json.NewDecoder(r.Body).Decode(&capturedPayload)
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Errorf("unexpected method %s", r.Method)
+		}
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv, "")
+	ref := CertReference{
+		Endpoint: "firewall/ssl-ssh-profile",
+		MKey:     "custom-deep-inspection",
+		Field:    "server-cert",
+		OldValue: "tm_lestang_dk_07052026",
+	}
+	if err := c.UpdateCertReference(context.Background(), ref, "tm_lestang_dk_15052026"); err != nil {
+		t.Fatalf("UpdateCertReference: %v", err)
+	}
+	got, _ := capturedPayload["server-cert"].(string)
+	want := "tm_lestang_dk_15052026 wildcard_aaris_tech_07052026 wildcard_aaris_wtf_07052026"
+	if got != want {
+		t.Errorf("server-cert payload =\n  %q\nwant\n  %q", got, want)
+	}
+}
+
+func TestUpdateCertReference_MultiValueArray(t *testing.T) {
+	// FortiGate sometimes returns multi-value fields as an array of
+	// {q_origin_key, name} objects. Verify the same preservation logic.
+	var capturedPayload map[string]interface{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			_, _ = io.WriteString(w, `{"results":{"server-cert":[
+				{"q_origin_key":"tm_lestang_dk_07052026","name":"tm_lestang_dk_07052026"},
+				{"q_origin_key":"wildcard_aaris_tech_07052026","name":"wildcard_aaris_tech_07052026"}
+			]}}`)
+		case http.MethodPut:
+			_ = json.NewDecoder(r.Body).Decode(&capturedPayload)
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Errorf("unexpected method %s", r.Method)
+		}
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv, "")
+	ref := CertReference{
+		Endpoint: "firewall/ssl-ssh-profile",
+		MKey:     "custom-deep-inspection",
+		Field:    "server-cert",
+		OldValue: "tm_lestang_dk_07052026",
+	}
+	if err := c.UpdateCertReference(context.Background(), ref, "tm_lestang_dk_15052026"); err != nil {
+		t.Fatalf("UpdateCertReference: %v", err)
+	}
+	arr, ok := capturedPayload["server-cert"].([]interface{})
+	if !ok {
+		t.Fatalf("server-cert payload is not array: %#v", capturedPayload["server-cert"])
+	}
+	if len(arr) != 2 {
+		t.Fatalf("array length = %d, want 2", len(arr))
+	}
+	names := []string{}
+	for _, item := range arr {
+		if m, ok := item.(map[string]interface{}); ok {
+			if n, _ := m["name"].(string); n != "" {
+				names = append(names, n)
+			}
+		}
+	}
+	if names[0] != "tm_lestang_dk_15052026" {
+		t.Errorf("names[0] = %q, want renamed entry", names[0])
+	}
+	if names[1] != "wildcard_aaris_tech_07052026" {
+		t.Errorf("names[1] = %q, want preserved sibling", names[1])
+	}
+}
+
+func TestFindCertReferences_MultiValueString(t *testing.T) {
+	// ssl-ssh-profile returns a list of profiles. One has server-cert as a
+	// space-separated multi-value string. valueContainsCert must split.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "firewall/ssl-ssh-profile"):
+			_, _ = io.WriteString(w, `{"results":[{"name":"custom-deep-inspection","server-cert":"tm_lestang_dk_07052026 wildcard_aaris_tech_07052026"}]}`)
+		default:
+			_, _ = io.WriteString(w, `{"results":[]}`)
+		}
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv, "")
+	refs, err := c.FindCertReferences(context.Background(), "tm_lestang_dk_07052026")
+	if err != nil {
+		t.Fatalf("FindCertReferences: %v", err)
+	}
+	found := false
+	for _, r := range refs {
+		if r.Endpoint == "firewall/ssl-ssh-profile" && r.MKey == "custom-deep-inspection" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected multi-value ssl-ssh-profile reference, got: %+v", refs)
 	}
 }
 

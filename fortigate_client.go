@@ -269,10 +269,13 @@ func (c *FortiGateClient) ImportCertificate(ctx context.Context, certName string
 }
 
 // DeleteCertificate removes a certificate from FortiGate by its exact name.
+//
+// FortiOS 7.6.6 removed the monitor endpoint /api/v2/monitor/vpn-certificate/local/clear
+// (returns 404), so we use the CMDB endpoint with HTTP DELETE.
 func (c *FortiGateClient) DeleteCertificate(ctx context.Context, certName string) error {
-	apiURL := c.buildURL("api/v2/monitor/vpn-certificate/local/clear", "mkey", certName)
+	apiURL := c.buildURL(fmt.Sprintf("api/v2/cmdb/vpn.certificate/local/%s", url.PathEscape(certName)))
 
-	body, statusCode, err := c.doRequest(ctx, http.MethodPost, apiURL, nil)
+	body, statusCode, err := c.doRequest(ctx, http.MethodDelete, apiURL, nil)
 	if err != nil {
 		return fmt.Errorf("deleting certificate %q: %w", certName, err)
 	}
@@ -319,7 +322,10 @@ func (c *FortiGateClient) FindCertReferences(ctx context.Context, certName strin
 	return refs, nil
 }
 
-// UpdateCertReference updates a single CMDB object to reference a new certificate name.
+// UpdateCertReference updates a single CMDB object to reference a new
+// certificate name. For multi-value fields (e.g. ssl-ssh-profile's
+// server-cert in "Protecting SSL Server" mode), it first GETs the current
+// value and replaces only the matching cert name, preserving siblings.
 func (c *FortiGateClient) UpdateCertReference(ctx context.Context, ref CertReference, newCertName string) error {
 	var apiURL string
 	if ref.MKey != "" {
@@ -328,8 +334,23 @@ func (c *FortiGateClient) UpdateCertReference(ctx context.Context, ref CertRefer
 		apiURL = c.buildURL(fmt.Sprintf("api/v2/cmdb/%s", ref.Endpoint))
 	}
 
-	payload := map[string]string{
-		ref.Field: newCertName,
+	getBody, statusCode, err := c.doRequest(ctx, http.MethodGet, apiURL, nil)
+	if err != nil {
+		return fmt.Errorf("fetching cert reference at %s: %w", ref.Endpoint, err)
+	}
+	if statusCode != http.StatusOK {
+		return fmt.Errorf("fetch cert reference at %s returned status %d: %s", ref.Endpoint, statusCode, string(getBody))
+	}
+
+	currentValue, err := extractFieldValueFromResults(getBody, ref.Field)
+	if err != nil {
+		return fmt.Errorf("extracting current value for %s/%s: %w", ref.Endpoint, ref.Field, err)
+	}
+
+	newValue := replaceCertInValue(currentValue, ref.OldValue, newCertName)
+
+	payload := map[string]interface{}{
+		ref.Field: newValue,
 	}
 
 	body, statusCode, err := c.doRequest(ctx, http.MethodPut, apiURL, payload)
@@ -361,18 +382,110 @@ func findRefsInList(body []byte, ep certRefEndpoint, certName string) []CertRefe
 
 	var refs []CertReference
 	for _, obj := range result.Results {
-		val, ok := obj[ep.field].(string)
-		if ok && val == certName {
-			mkey, _ := obj[ep.keyField].(string)
-			refs = append(refs, CertReference{
-				Endpoint: ep.path,
-				MKey:     mkey,
-				Field:    ep.field,
-				OldValue: certName,
-			})
+		if !valueContainsCert(obj[ep.field], certName) {
+			continue
 		}
+		mkey, _ := obj[ep.keyField].(string)
+		refs = append(refs, CertReference{
+			Endpoint: ep.path,
+			MKey:     mkey,
+			Field:    ep.field,
+			OldValue: certName,
+		})
 	}
 	return refs
+}
+
+// valueContainsCert returns true if val references certName. A string value
+// is split on whitespace (FortiGate multi-value fields like
+// ssl-ssh-profile server-cert are returned as space-separated quoted names
+// joined into one string by the JSON API). An array value is expected to
+// contain objects keyed by "name" or "q_origin_key".
+func valueContainsCert(val interface{}, certName string) bool {
+	switch v := val.(type) {
+	case string:
+		for _, token := range strings.Fields(v) {
+			if strings.Trim(token, `"`) == certName {
+				return true
+			}
+		}
+	case []interface{}:
+		for _, item := range v {
+			m, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if name, _ := m["q_origin_key"].(string); name == certName {
+				return true
+			}
+			if name, _ := m["name"].(string); name == certName {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// extractFieldValueFromResults reads the named field out of a FortiGate
+// CMDB response, accepting either a singleton "results" object or a
+// single-element "results" array.
+func extractFieldValueFromResults(body []byte, field string) (interface{}, error) {
+	var raw struct {
+		Results json.RawMessage `json:"results"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, fmt.Errorf("parsing response: %w", err)
+	}
+
+	var asMap map[string]interface{}
+	if err := json.Unmarshal(raw.Results, &asMap); err == nil && asMap != nil {
+		if v, ok := asMap[field]; ok {
+			return v, nil
+		}
+	}
+
+	var asArr []map[string]interface{}
+	if err := json.Unmarshal(raw.Results, &asArr); err == nil && len(asArr) > 0 {
+		if v, ok := asArr[0][field]; ok {
+			return v, nil
+		}
+	}
+
+	return nil, fmt.Errorf("field %q not present in results", field)
+}
+
+// replaceCertInValue returns a copy of val with oldName swapped for
+// newName. Strings are tokenized on whitespace and rejoined with single
+// spaces; arrays of objects produce [{"name": ...}, ...] entries.
+func replaceCertInValue(val interface{}, oldName, newName string) interface{} {
+	switch v := val.(type) {
+	case string:
+		tokens := strings.Fields(v)
+		for i, t := range tokens {
+			if strings.Trim(t, `"`) == oldName {
+				tokens[i] = newName
+			}
+		}
+		return strings.Join(tokens, " ")
+	case []interface{}:
+		out := make([]map[string]string, 0, len(v))
+		for _, item := range v {
+			m, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			name, _ := m["name"].(string)
+			if name == "" {
+				name, _ = m["q_origin_key"].(string)
+			}
+			if name == oldName {
+				name = newName
+			}
+			out = append(out, map[string]string{"name": name})
+		}
+		return out
+	}
+	return val
 }
 
 // stripPEMHeaders returns the raw base64 body of a PEM block with all
@@ -406,13 +519,12 @@ func findRefsInSingleton(body []byte, ep certRefEndpoint, certName string) *Cert
 		result.Results = resultArr.Results[0]
 	}
 
-	val, ok := result.Results[ep.field].(string)
-	if ok && val == certName {
-		return &CertReference{
-			Endpoint: ep.path,
-			Field:    ep.field,
-			OldValue: certName,
-		}
+	if !valueContainsCert(result.Results[ep.field], certName) {
+		return nil
 	}
-	return nil
+	return &CertReference{
+		Endpoint: ep.path,
+		Field:    ep.field,
+		OldValue: certName,
+	}
 }
