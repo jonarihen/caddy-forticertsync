@@ -8,7 +8,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"go.uber.org/zap"
 )
@@ -37,14 +36,16 @@ func TestBuildURL(t *testing.T) {
 }
 
 func TestListCertificates(t *testing.T) {
+	// CMDB response shape from FortiOS 7.6.6:
+	//   /api/v2/cmdb/vpn.certificate/local
 	body := `{
 		"results": [
-			{"name":"cert1","subject":"CN=foo","issuer":"CN=ca","valid_from":1700000000,"valid_to":1800000000,"serial_number":"01","source":"user","q_ref":2},
-			{"name":"cert2","subject":"CN=bar","issuer":"CN=ca","valid_from":"1710000000","valid_to":"2024-06-01 00:00:00 GMT","serial_number":"02","source":"user","q_ref":0}
+			{"name":"Fortinet_Factory","source":"factory","last-updated":0},
+			{"name":"example_com_07052026","source":"user","last-updated":0}
 		]
 	}`
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.HasPrefix(r.URL.Path, "/api/v2/monitor/vpn-certificate/local/select") {
+		if !strings.HasPrefix(r.URL.Path, "/api/v2/cmdb/vpn.certificate/local") {
 			t.Errorf("unexpected path: %s", r.URL.Path)
 		}
 		if r.Header.Get("Authorization") != "Bearer test-token" {
@@ -63,21 +64,11 @@ func TestListCertificates(t *testing.T) {
 	if len(certs) != 2 {
 		t.Fatalf("len = %d, want 2", len(certs))
 	}
-	if certs[0].Name != "cert1" || certs[0].QRef != 2 {
+	if certs[0].Name != "Fortinet_Factory" || certs[0].Source != "factory" {
 		t.Errorf("certs[0] = %+v", certs[0])
 	}
-	if certs[0].NotBefore.IsZero() || certs[0].NotAfter.IsZero() {
-		t.Errorf("certs[0] dates not parsed: %+v", certs[0])
-	}
-	wantFrom := time.Unix(1700000000, 0).UTC()
-	if !certs[0].NotBefore.Equal(wantFrom) {
-		t.Errorf("certs[0].NotBefore = %v, want %v", certs[0].NotBefore, wantFrom)
-	}
-	if certs[1].NotBefore.IsZero() {
-		t.Error("certs[1] NotBefore (string-encoded epoch) not parsed")
-	}
-	if certs[1].NotAfter.IsZero() {
-		t.Error("certs[1] NotAfter (formatted string) not parsed")
+	if certs[1].Name != "example_com_07052026" || certs[1].Source != "user" {
+		t.Errorf("certs[1] = %+v", certs[1])
 	}
 }
 
@@ -161,7 +152,7 @@ func TestImportCertificate_GlobalScope(t *testing.T) {
 func TestImportCertificate_Error(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
-		_, _ = io.WriteString(w, `{"error":"bad cert"}`)
+		_, _ = io.WriteString(w, `{"error":-145}`)
 	}))
 	defer srv.Close()
 
@@ -169,6 +160,23 @@ func TestImportCertificate_Error(t *testing.T) {
 	err := c.ImportCertificate(context.Background(), "mycert", []byte("p"), []byte("k"))
 	if err == nil {
 		t.Fatal("expected error")
+	}
+}
+
+func TestImportCertificate_AlreadyExists(t *testing.T) {
+	// FortiOS returns HTTP 500 with {"error":-23} when the same cert is
+	// imported twice. We treat that as success.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, `{"error":-23,"status":"error"}`)
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv, "")
+	certPEM := []byte("-----BEGIN CERTIFICATE-----\nQUJDRA==\n-----END CERTIFICATE-----\n")
+	keyPEM := []byte("-----BEGIN EC PRIVATE KEY-----\nS0VZ\n-----END EC PRIVATE KEY-----\n")
+	if err := c.ImportCertificate(context.Background(), "mycert", certPEM, keyPEM); err != nil {
+		t.Fatalf("ImportCertificate with -23 should return nil, got %v", err)
 	}
 }
 
@@ -271,12 +279,14 @@ func TestUpdateCertReference(t *testing.T) {
 }
 
 func TestGetCertificateByPattern(t *testing.T) {
+	// CMDB response (FortiOS 7.6.6) — no validity dates, so ordering must
+	// fall back to the _ddMMyyyy suffix encoded in the cert name.
 	body := `{
 		"results": [
-			{"name":"example_com","valid_from":1600000000,"valid_to":1700000000},
-			{"name":"example_com_07052026","valid_from":1750000000,"valid_to":1800000000},
-			{"name":"example_com_01012025","valid_from":1700000000,"valid_to":1750000000},
-			{"name":"unrelated_cert","valid_from":1900000000,"valid_to":2000000000}
+			{"name":"example_com","source":"user","last-updated":0},
+			{"name":"example_com_07052026","source":"user","last-updated":0},
+			{"name":"example_com_01012025","source":"user","last-updated":0},
+			{"name":"unrelated_cert","source":"user","last-updated":0}
 		]
 	}`
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -303,31 +313,6 @@ func TestGetCertificateByPattern(t *testing.T) {
 	}
 	if got != nil {
 		t.Errorf("expected nil for no match, got %+v", got)
-	}
-}
-
-func TestParseFortiDate(t *testing.T) {
-	tests := []struct {
-		name    string
-		raw     string
-		wantErr bool
-	}{
-		{"epoch number", `1700000000`, false},
-		{"epoch as string", `"1700000000"`, false},
-		{"RFC3339", `"2024-06-01T12:00:00Z"`, false},
-		{"FortiOS dash format", `"2024-06-01 12:00:00 GMT"`, false},
-		{"empty", ``, true},
-		{"null", `null`, true},
-		{"empty string", `""`, true},
-		{"unknown format", `"not a date"`, true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			_, err := parseFortiDate([]byte(tt.raw))
-			if (err != nil) != tt.wantErr {
-				t.Errorf("parseFortiDate(%s) err = %v, wantErr = %v", tt.raw, err, tt.wantErr)
-			}
-		})
 	}
 }
 

@@ -181,9 +181,8 @@ func (h *Handler) syncCertToFortiGate(ctx context.Context, mapping CertMapping, 
 	// Generate date-suffixed cert name
 	newCertName := fmt.Sprintf("%s_%s", mapping.Name, time.Now().Format("02012006"))
 
-	// Parse the new cert to get its NotBefore date for comparison
-	newCertParsed, err := parsePEMCertificate(certPEM)
-	if err != nil {
+	// Validate the new cert parses cleanly before any API calls.
+	if _, err := parsePEMCertificate(certPEM); err != nil {
 		return fmt.Errorf("parsing new certificate: %w", err)
 	}
 
@@ -196,12 +195,13 @@ func (h *Handler) syncCertToFortiGate(ctx context.Context, mapping CertMapping, 
 	}
 
 	if currentCert != nil {
-		// Compare: is the new cert actually newer?
-		if !newCertParsed.NotBefore.After(currentCert.NotBefore) {
-			h.logger.Info("cert on FortiGate is already current or newer, skipping",
-				zap.String("fortigate_cert", currentCert.Name),
-				zap.Time("fortigate_not_before", currentCert.NotBefore),
-				zap.Time("new_not_before", newCertParsed.NotBefore))
+		// The FortiGate CMDB does not expose certificate validity dates on
+		// FortiOS 7.6.6, so we compare by date-suffixed name instead. If a
+		// cert with today's suffix already exists, the renewal has already
+		// been synced — skip. Otherwise proceed to rebind.
+		if currentCert.Name == newCertName {
+			h.logger.Info("cert on FortiGate is already current, skipping",
+				zap.String("fortigate_cert", currentCert.Name))
 			return nil
 		}
 

@@ -9,7 +9,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"time"
 
@@ -25,16 +24,15 @@ type FortiGateClient struct {
 	logger     *zap.Logger
 }
 
-// FortiCert represents a certificate stored on FortiGate.
+// FortiCert represents a certificate stored on FortiGate, as returned by
+// the CMDB endpoint /api/v2/cmdb/vpn.certificate/local. The CMDB response
+// has no validity dates — the monitor endpoint that did is not available
+// on FortiOS 7.6.6, so we rely on the date suffix in the cert name for
+// ordering.
 type FortiCert struct {
-	Name      string
-	Subject   string
-	Issuer    string
-	NotBefore time.Time
-	NotAfter  time.Time
-	Serial    string
-	Source    string
-	QRef     int // Reference count
+	Name        string
+	Source      string
+	LastUpdated int64
 }
 
 // CertReference represents an object on FortiGate that references a certificate.
@@ -138,6 +136,8 @@ func (c *FortiGateClient) doRequest(ctx context.Context, method, apiURL string, 
 
 // GetCertificateByPattern retrieves the latest certificate from FortiGate whose name
 // matches the given base pattern (with or without a date suffix like "_ddMMyyyy").
+// Ordering uses the trailing _ddMMyyyy date suffix on the cert name, since the
+// CMDB response has no validity dates.
 func (c *FortiGateClient) GetCertificateByPattern(ctx context.Context, namePattern string) (*FortiCert, error) {
 	certs, err := c.ListCertificates(ctx)
 	if err != nil {
@@ -145,13 +145,14 @@ func (c *FortiGateClient) GetCertificateByPattern(ctx context.Context, namePatte
 	}
 
 	var best *FortiCert
+	var bestDate time.Time
 	for i := range certs {
 		cert := &certs[i]
-		// Match if the cert name equals the pattern exactly,
-		// or starts with the pattern followed by an underscore (date suffix).
 		if cert.Name == namePattern || strings.HasPrefix(cert.Name, namePattern+"_") {
-			if best == nil || cert.NotBefore.After(best.NotBefore) {
+			d := extractNameDate(cert.Name)
+			if best == nil || d.After(bestDate) {
 				best = cert
+				bestDate = d
 			}
 		}
 	}
@@ -162,9 +163,28 @@ func (c *FortiGateClient) GetCertificateByPattern(ctx context.Context, namePatte
 	return best, nil
 }
 
+// extractNameDate parses a trailing "_ddMMyyyy" suffix off a cert name and
+// returns the encoded date. Returns the zero time if no parseable suffix
+// is present.
+func extractNameDate(name string) time.Time {
+	idx := strings.LastIndex(name, "_")
+	if idx < 0 || len(name)-idx-1 != 8 {
+		return time.Time{}
+	}
+	t, err := time.Parse("02012006", name[idx+1:])
+	if err != nil {
+		return time.Time{}
+	}
+	return t
+}
+
 // ListCertificates returns all local certificates on the FortiGate.
+//
+// FortiOS 7.6.6 removed the monitor endpoint /api/v2/monitor/vpn-certificate/local/select
+// (returns 404), so we use the CMDB endpoint instead. The CMDB response only
+// carries name, source, and last-updated — no validity dates.
 func (c *FortiGateClient) ListCertificates(ctx context.Context) ([]FortiCert, error) {
-	apiURL := c.buildURL("api/v2/monitor/vpn-certificate/local/select")
+	apiURL := c.buildURL("api/v2/cmdb/vpn.certificate/local")
 
 	body, statusCode, err := c.doRequest(ctx, http.MethodGet, apiURL, nil)
 	if err != nil {
@@ -174,19 +194,11 @@ func (c *FortiGateClient) ListCertificates(ctx context.Context) ([]FortiCert, er
 		return nil, fmt.Errorf("list certificates returned status %d: %s", statusCode, string(body))
 	}
 
-	// FortiGate returns JSON with a "results" array. Date fields can be
-	// either Unix epoch seconds (number) or formatted strings depending on
-	// FortiOS version, so we use json.RawMessage and a flexible parser.
 	var result struct {
 		Results []struct {
-			Name      string          `json:"name"`
-			Subject   string          `json:"subject"`
-			Issuer    string          `json:"issuer"`
-			ValidFrom json.RawMessage `json:"valid_from"`
-			ValidTo   json.RawMessage `json:"valid_to"`
-			Serial    string          `json:"serial_number"`
-			Source    string          `json:"source"`
-			QRef      int             `json:"q_ref"`
+			Name        string `json:"name"`
+			Source      string `json:"source"`
+			LastUpdated int64  `json:"last-updated"`
 		} `json:"results"`
 	}
 
@@ -196,70 +208,14 @@ func (c *FortiGateClient) ListCertificates(ctx context.Context) ([]FortiCert, er
 
 	certs := make([]FortiCert, 0, len(result.Results))
 	for _, r := range result.Results {
-		cert := FortiCert{
-			Name:    r.Name,
-			Subject: r.Subject,
-			Issuer:  r.Issuer,
-			Serial:  r.Serial,
-			Source:  r.Source,
-			QRef:    r.QRef,
-		}
-		if t, err := parseFortiDate(r.ValidFrom); err == nil {
-			cert.NotBefore = t
-		}
-		if t, err := parseFortiDate(r.ValidTo); err == nil {
-			cert.NotAfter = t
-		}
-		certs = append(certs, cert)
+		certs = append(certs, FortiCert{
+			Name:        r.Name,
+			Source:      r.Source,
+			LastUpdated: r.LastUpdated,
+		})
 	}
 
 	return certs, nil
-}
-
-// parseFortiDate parses a FortiGate date field which may be either a Unix
-// epoch (as a JSON number or a quoted numeric string) or a formatted date
-// string in one of several common FortiOS shapes.
-func parseFortiDate(raw json.RawMessage) (time.Time, error) {
-	if len(raw) == 0 || string(raw) == "null" {
-		return time.Time{}, fmt.Errorf("empty date field")
-	}
-
-	// Try as a JSON number (epoch seconds)
-	var n int64
-	if err := json.Unmarshal(raw, &n); err == nil {
-		return time.Unix(n, 0).UTC(), nil
-	}
-
-	// Try as a quoted string
-	var s string
-	if err := json.Unmarshal(raw, &s); err != nil {
-		return time.Time{}, fmt.Errorf("date field is neither number nor string: %s", string(raw))
-	}
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return time.Time{}, fmt.Errorf("empty date string")
-	}
-
-	// String containing only digits → epoch seconds
-	if epoch, err := strconv.ParseInt(s, 10, 64); err == nil {
-		return time.Unix(epoch, 0).UTC(), nil
-	}
-
-	// Try common FortiOS date string formats
-	formats := []string{
-		time.RFC3339,
-		"2006-01-02 15:04:05 MST",
-		"2006-01-02 15:04:05",
-		"Jan 2 15:04:05 2006 MST",
-		"Jan _2 15:04:05 2006 GMT",
-		"Mon Jan _2 15:04:05 2006 MST",
-	}
-	for _, f := range formats {
-		if t, err := time.Parse(f, s); err == nil {
-			return t.UTC(), nil
-		}
-	}
-	return time.Time{}, fmt.Errorf("unrecognized date format: %q", s)
 }
 
 // ImportCertificate uploads a new certificate and private key to FortiGate.
@@ -292,6 +248,18 @@ func (c *FortiGateClient) ImportCertificate(ctx context.Context, certName string
 	}
 
 	if statusCode != http.StatusOK {
+		// FortiOS returns error -23 ("entry already exists") with HTTP 500
+		// when the same cert content is re-imported. Multiple domains can
+		// share a single FortiGate cert slot, so two cert_obtained events
+		// for the same SAN cert race and the second loses. Treat as success.
+		var errResp struct {
+			Error int `json:"error"`
+		}
+		if jsonErr := json.Unmarshal(body, &errResp); jsonErr == nil && errResp.Error == -23 {
+			c.logger.Info("certificate already exists on FortiGate, skipping",
+				zap.String("cert_name", certName))
+			return nil
+		}
 		return fmt.Errorf("import certificate %q returned status %d: %s", certName, statusCode, string(body))
 	}
 
