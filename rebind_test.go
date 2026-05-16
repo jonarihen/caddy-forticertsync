@@ -79,7 +79,9 @@ func TestRebindCertificates_HappyPath(t *testing.T) {
 
 	c := NewFortiGateClient(srv.URL, "tok", "", true, zap.NewNop())
 	err := RebindCertificates(context.Background(), c, zap.NewNop(),
-		"oldcert", "newcert", []byte("CERTPEM"), []byte("KEYPEM"))
+		"oldcert", "newcert",
+		[]byte("-----BEGIN CERTIFICATE-----\nQUJDRA==\n-----END CERTIFICATE-----\n"),
+		[]byte("-----BEGIN EC PRIVATE KEY-----\nS0VZQk9EWQ==\n-----END EC PRIVATE KEY-----\n"))
 	if err != nil {
 		t.Fatalf("RebindCertificates: %v", err)
 	}
@@ -99,7 +101,9 @@ func TestRebindCertificates_NoReferences(t *testing.T) {
 
 	c := NewFortiGateClient(srv.URL, "tok", "", true, zap.NewNop())
 	err := RebindCertificates(context.Background(), c, zap.NewNop(),
-		"oldcert", "newcert", []byte("p"), []byte("k"))
+		"oldcert", "newcert",
+		[]byte("-----BEGIN CERTIFICATE-----\nQUJDRA==\n-----END CERTIFICATE-----\n"),
+		[]byte("-----BEGIN EC PRIVATE KEY-----\nS0VZQk9EWQ==\n-----END EC PRIVATE KEY-----\n"))
 	if err != nil {
 		t.Fatalf("RebindCertificates: %v", err)
 	}
@@ -120,7 +124,9 @@ func TestRebindCertificates_PartialRebindFailure(t *testing.T) {
 
 	c := NewFortiGateClient(srv.URL, "tok", "", true, zap.NewNop())
 	err := RebindCertificates(context.Background(), c, zap.NewNop(),
-		"oldcert", "newcert", []byte("p"), []byte("k"))
+		"oldcert", "newcert",
+		[]byte("-----BEGIN CERTIFICATE-----\nQUJDRA==\n-----END CERTIFICATE-----\n"),
+		[]byte("-----BEGIN EC PRIVATE KEY-----\nS0VZQk9EWQ==\n-----END EC PRIVATE KEY-----\n"))
 	if err == nil {
 		t.Fatal("expected error from partial rebind failure")
 	}
@@ -167,7 +173,9 @@ func TestRebindCertificates_ReferencesRemainAfterRebind(t *testing.T) {
 
 	c := NewFortiGateClient(srv.URL, "tok", "", true, zap.NewNop())
 	err := RebindCertificates(context.Background(), c, zap.NewNop(),
-		"oldcert", "newcert", []byte("p"), []byte("k"))
+		"oldcert", "newcert",
+		[]byte("-----BEGIN CERTIFICATE-----\nQUJDRA==\n-----END CERTIFICATE-----\n"),
+		[]byte("-----BEGIN EC PRIVATE KEY-----\nS0VZQk9EWQ==\n-----END EC PRIVATE KEY-----\n"))
 	if err != nil {
 		t.Fatalf("RebindCertificates returned error: %v (should be nil — non-fatal)", err)
 	}

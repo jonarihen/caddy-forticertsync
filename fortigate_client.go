@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"net/http"
@@ -222,12 +224,24 @@ func (c *FortiGateClient) ListCertificates(ctx context.Context) ([]FortiCert, er
 //
 // PEM payload format — confirmed against FortiOS 7.6.6.
 // Sending full armored PEM (BEGIN/END headers + newlines) is rejected with
-// HTTP 500 / error -145. The API accepts only the raw base64 body, so we
-// strip the PEM armor before sending. FortiOS 7.6 administration guide
-// documents file_content as a string field but does not specify the
+// HTTP 500 / error -145. The API accepts only the raw base64 body of a
+// single certificate, so we parse certPEM, take the first CERTIFICATE block
+// (the leaf), and send its base64-encoded DER. FortiOS 7.6 administration
+// guide documents file_content as a string field but does not specify the
 // encoding requirement:
-//   https://docs.fortinet.com/document/fortigate/7.6.0/administration-guide/379103
+//
+//	https://docs.fortinet.com/document/fortigate/7.6.0/administration-guide/379103
+//
+// Intermediate CAs in the input chain are NOT sent here; the caller is
+// responsible for importing them separately via ImportCACertificate so
+// FortiGate's TLS engine can include them in the handshake.
 func (c *FortiGateClient) ImportCertificate(ctx context.Context, certName string, certPEM, keyPEM []byte) error {
+	blocks, err := splitPEMChain(certPEM)
+	if err != nil {
+		return fmt.Errorf("parsing certificate PEM for %q: %w", certName, err)
+	}
+	leafBase64 := base64.StdEncoding.EncodeToString(blocks[0].Bytes)
+
 	apiURL := c.buildURL("api/v2/monitor/vpn-certificate/local/import")
 
 	scope := "global"
@@ -237,7 +251,7 @@ func (c *FortiGateClient) ImportCertificate(ctx context.Context, certName string
 	payload := map[string]string{
 		"type":             "regular",
 		"certname":         certName,
-		"file_content":     stripPEMHeaders(certPEM),
+		"file_content":     leafBase64,
 		"key_file_content": stripPEMHeaders(keyPEM),
 		"scope":            scope,
 	}
@@ -252,10 +266,7 @@ func (c *FortiGateClient) ImportCertificate(ctx context.Context, certName string
 		// when the same cert content is re-imported. Multiple domains can
 		// share a single FortiGate cert slot, so two cert_obtained events
 		// for the same SAN cert race and the second loses. Treat as success.
-		var errResp struct {
-			Error int `json:"error"`
-		}
-		if jsonErr := json.Unmarshal(body, &errResp); jsonErr == nil && errResp.Error == -23 {
+		if isAlreadyExistsError(body) {
 			c.logger.Info("certificate already exists on FortiGate, skipping",
 				zap.String("cert_name", certName))
 			return nil
@@ -266,6 +277,83 @@ func (c *FortiGateClient) ImportCertificate(ctx context.Context, certName string
 	c.logger.Info("certificate imported to FortiGate",
 		zap.String("cert_name", certName))
 	return nil
+}
+
+// ImportCACertificate uploads an intermediate or root CA certificate to
+// FortiGate. FortiOS uses the CA store to construct the chain it presents
+// during TLS handshakes for any leaf cert whose issuer matches an entry
+// here, so importing the intermediate alongside the leaf is what makes
+// strict TLS clients (Android OkHttp, Java's TrustManager) trust the
+// chain. The caDER argument is the raw DER body of a single CA cert.
+func (c *FortiGateClient) ImportCACertificate(ctx context.Context, caName string, caDER []byte) error {
+	apiURL := c.buildURL("api/v2/monitor/vpn-certificate/ca/import")
+
+	scope := "global"
+	if c.vdom != "" {
+		scope = "vdom"
+	}
+	payload := map[string]string{
+		"scope":         scope,
+		"import_method": "file",
+		"certname":      caName,
+		"file_content":  base64.StdEncoding.EncodeToString(caDER),
+	}
+
+	body, statusCode, err := c.doRequest(ctx, http.MethodPost, apiURL, payload)
+	if err != nil {
+		return fmt.Errorf("importing CA certificate %q: %w", caName, err)
+	}
+
+	if statusCode != http.StatusOK {
+		// Same -23 semantics as ImportCertificate. We use deterministic
+		// CA names (chain_<hash>) so renewals re-attempt the same import
+		// every time — "already exists" is the common case, not an error.
+		if isAlreadyExistsError(body) {
+			c.logger.Debug("CA certificate already exists on FortiGate, skipping",
+				zap.String("ca_name", caName))
+			return nil
+		}
+		return fmt.Errorf("import CA certificate %q returned status %d: %s", caName, statusCode, string(body))
+	}
+
+	c.logger.Info("CA certificate imported to FortiGate",
+		zap.String("ca_name", caName))
+	return nil
+}
+
+// isAlreadyExistsError returns true if the FortiGate response body
+// contains error code -23 ("entry already exists").
+func isAlreadyExistsError(body []byte) bool {
+	var errResp struct {
+		Error int `json:"error"`
+	}
+	if err := json.Unmarshal(body, &errResp); err != nil {
+		return false
+	}
+	return errResp.Error == -23
+}
+
+// splitPEMChain returns every CERTIFICATE block from a PEM bundle in the
+// order they appear. blocks[0] is the leaf; blocks[1:] are intermediates
+// (the root is usually omitted by ACME servers). Non-CERTIFICATE blocks
+// are skipped.
+func splitPEMChain(pemData []byte) ([]*pem.Block, error) {
+	var blocks []*pem.Block
+	rest := pemData
+	for {
+		var blk *pem.Block
+		blk, rest = pem.Decode(rest)
+		if blk == nil {
+			break
+		}
+		if blk.Type == "CERTIFICATE" {
+			blocks = append(blocks, blk)
+		}
+	}
+	if len(blocks) == 0 {
+		return nil, fmt.Errorf("no CERTIFICATE blocks in PEM data")
+	}
+	return blocks, nil
 }
 
 // DeleteCertificate removes a certificate from FortiGate by its exact name.

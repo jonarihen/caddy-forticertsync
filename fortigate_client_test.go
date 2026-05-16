@@ -102,7 +102,7 @@ func TestImportCertificate(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(t, srv, "root")
-	certPEM := []byte("-----BEGIN CERTIFICATE-----\nQUJDRA==\nRUZHSA==\n-----END CERTIFICATE-----\n")
+	certPEM := []byte("-----BEGIN CERTIFICATE-----\nQUJDRA==\n-----END CERTIFICATE-----\n")
 	keyPEM := []byte("-----BEGIN EC PRIVATE KEY-----\nS0VZQk9EWQ==\n-----END EC PRIVATE KEY-----\n")
 	err := c.ImportCertificate(context.Background(), "mycert", certPEM, keyPEM)
 	if err != nil {
@@ -111,9 +111,10 @@ func TestImportCertificate(t *testing.T) {
 	if capturedPayload["certname"] != "mycert" {
 		t.Errorf("certname = %q", capturedPayload["certname"])
 	}
-	// FortiOS 7.6.6 requires stripped base64 — no BEGIN/END armor, no newlines.
-	if capturedPayload["file_content"] != "QUJDRA==RUZHSA==" {
-		t.Errorf("file_content = %q, want stripped base64 body", capturedPayload["file_content"])
+	// FortiOS 7.6.6 requires base64 DER of the leaf cert (no PEM armor).
+	// Body "QUJDRA==" decodes to "ABCD" → re-encoded as base64 = "QUJDRA==".
+	if capturedPayload["file_content"] != "QUJDRA==" {
+		t.Errorf("file_content = %q, want base64 DER of leaf", capturedPayload["file_content"])
 	}
 	if capturedPayload["key_file_content"] != "S0VZQk9EWQ==" {
 		t.Errorf("key_file_content = %q, want stripped base64 body", capturedPayload["key_file_content"])
@@ -157,9 +158,41 @@ func TestImportCertificate_Error(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(t, srv, "")
-	err := c.ImportCertificate(context.Background(), "mycert", []byte("p"), []byte("k"))
+	certPEM := []byte("-----BEGIN CERTIFICATE-----\nQUJDRA==\n-----END CERTIFICATE-----\n")
+	keyPEM := []byte("-----BEGIN EC PRIVATE KEY-----\nS0VZQk9EWQ==\n-----END EC PRIVATE KEY-----\n")
+	err := c.ImportCertificate(context.Background(), "mycert", certPEM, keyPEM)
 	if err == nil {
 		t.Fatal("expected error")
+	}
+}
+
+func TestImportCertificate_ChainInput(t *testing.T) {
+	// When certPEM contains leaf + intermediate, only the leaf must be sent
+	// in the /local/import call. Intermediates are uploaded separately via
+	// ImportCACertificate; bundling them in file_content used to break
+	// FortiOS's TLS handshake because it parsed only the first ASN.1
+	// SEQUENCE and discarded the trailing intermediate bytes.
+	var capturedPayload map[string]string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&capturedPayload)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	chainPEM := []byte(
+		"-----BEGIN CERTIFICATE-----\nQUJDRA==\n-----END CERTIFICATE-----\n" +
+			"-----BEGIN CERTIFICATE-----\nRUZHSA==\n-----END CERTIFICATE-----\n")
+	keyPEM := []byte("-----BEGIN EC PRIVATE KEY-----\nS0VZQk9EWQ==\n-----END EC PRIVATE KEY-----\n")
+
+	c := newTestClient(t, srv, "")
+	if err := c.ImportCertificate(context.Background(), "mycert", chainPEM, keyPEM); err != nil {
+		t.Fatalf("ImportCertificate: %v", err)
+	}
+	if capturedPayload["file_content"] != "QUJDRA==" {
+		t.Errorf("file_content = %q, want leaf only (\"QUJDRA==\")", capturedPayload["file_content"])
+	}
+	if strings.Contains(capturedPayload["file_content"], "RUZHSA") {
+		t.Errorf("file_content leaked intermediate bytes: %q", capturedPayload["file_content"])
 	}
 }
 
@@ -440,5 +473,113 @@ func TestStripPEMHeaders(t *testing.T) {
 	got := stripPEMHeaders([]byte(pem))
 	if got != "ABCDEFGH" {
 		t.Errorf("got %q, want %q", got, "ABCDEFGH")
+	}
+}
+
+func TestSplitPEMChain(t *testing.T) {
+	leaf := "-----BEGIN CERTIFICATE-----\nQUJDRA==\n-----END CERTIFICATE-----\n"
+	inter := "-----BEGIN CERTIFICATE-----\nRUZHSA==\n-----END CERTIFICATE-----\n"
+	keyBlock := "-----BEGIN EC PRIVATE KEY-----\nS0VZ\n-----END EC PRIVATE KEY-----\n"
+
+	t.Run("two CERTIFICATE blocks", func(t *testing.T) {
+		blocks, err := splitPEMChain([]byte(leaf + inter))
+		if err != nil {
+			t.Fatalf("splitPEMChain: %v", err)
+		}
+		if len(blocks) != 2 {
+			t.Fatalf("len = %d, want 2", len(blocks))
+		}
+		if blocks[0].Type != "CERTIFICATE" || blocks[1].Type != "CERTIFICATE" {
+			t.Errorf("types = %q, %q", blocks[0].Type, blocks[1].Type)
+		}
+		if string(blocks[0].Bytes) != "ABCD" {
+			t.Errorf("blocks[0].Bytes = %q, want ABCD", string(blocks[0].Bytes))
+		}
+	})
+
+	t.Run("single CERTIFICATE block", func(t *testing.T) {
+		blocks, err := splitPEMChain([]byte(leaf))
+		if err != nil {
+			t.Fatalf("splitPEMChain: %v", err)
+		}
+		if len(blocks) != 1 {
+			t.Errorf("len = %d, want 1", len(blocks))
+		}
+	})
+
+	t.Run("non-CERTIFICATE blocks are skipped", func(t *testing.T) {
+		blocks, err := splitPEMChain([]byte(keyBlock + leaf))
+		if err != nil {
+			t.Fatalf("splitPEMChain: %v", err)
+		}
+		if len(blocks) != 1 || blocks[0].Type != "CERTIFICATE" {
+			t.Errorf("got %d blocks, first type = %q", len(blocks), blocks[0].Type)
+		}
+	})
+
+	t.Run("garbage input errors", func(t *testing.T) {
+		if _, err := splitPEMChain([]byte("not a pem block")); err == nil {
+			t.Error("expected error on non-PEM input")
+		}
+	})
+
+	t.Run("empty input errors", func(t *testing.T) {
+		if _, err := splitPEMChain(nil); err == nil {
+			t.Error("expected error on empty input")
+		}
+	})
+}
+
+func TestImportCACertificate(t *testing.T) {
+	var capturedPayload map[string]string
+	var capturedPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s", r.Method)
+		}
+		capturedPath = r.URL.Path
+		_ = json.NewDecoder(r.Body).Decode(&capturedPayload)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv, "")
+	caDER := []byte("DERBYTES")
+	if err := c.ImportCACertificate(context.Background(), "chain_abcd1234", caDER); err != nil {
+		t.Fatalf("ImportCACertificate: %v", err)
+	}
+	if !strings.HasSuffix(capturedPath, "/api/v2/monitor/vpn-certificate/ca/import") {
+		t.Errorf("path = %s", capturedPath)
+	}
+	if capturedPayload["certname"] != "chain_abcd1234" {
+		t.Errorf("certname = %q", capturedPayload["certname"])
+	}
+	if capturedPayload["import_method"] != "file" {
+		t.Errorf("import_method = %q, want file", capturedPayload["import_method"])
+	}
+	if capturedPayload["scope"] != "global" {
+		t.Errorf("scope = %q, want global", capturedPayload["scope"])
+	}
+	// "DERBYTES" base64-encoded is "REVSQllURVM=".
+	if capturedPayload["file_content"] != "REVSQllURVM=" {
+		t.Errorf("file_content = %q, want base64(DERBYTES)", capturedPayload["file_content"])
+	}
+	if _, hasKey := capturedPayload["key_file_content"]; hasKey {
+		t.Error("ImportCACertificate must not send key_file_content")
+	}
+}
+
+func TestImportCACertificate_AlreadyExists(t *testing.T) {
+	// Renewals re-import the same intermediate every time. FortiOS returns
+	// error -23, which we swallow so a renewal isn't a hard failure.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, `{"error":-23,"status":"error"}`)
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv, "")
+	if err := c.ImportCACertificate(context.Background(), "chain_abcd1234", []byte("DER")); err != nil {
+		t.Fatalf("ImportCACertificate with -23 should return nil, got %v", err)
 	}
 }

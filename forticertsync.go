@@ -4,7 +4,9 @@ package forticertsync
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/pem"
 	"fmt"
 	"os"
@@ -210,15 +212,51 @@ func (h *Handler) syncCertToFortiGate(ctx context.Context, mapping CertMapping, 
 			zap.String("old_cert", currentCert.Name),
 			zap.String("new_cert", newCertName))
 
-		return RebindCertificates(ctx, h.client, h.logger,
-			currentCert.Name, newCertName, certPEM, keyPEM)
+		if err := RebindCertificates(ctx, h.client, h.logger,
+			currentCert.Name, newCertName, certPEM, keyPEM); err != nil {
+			return err
+		}
+	} else {
+		// No existing cert found, do a first-time import
+		h.logger.Info("no existing cert found on FortiGate, importing fresh",
+			zap.String("cert_name", newCertName))
+
+		if err := h.client.ImportCertificate(ctx, newCertName, certPEM, keyPEM); err != nil {
+			return err
+		}
 	}
 
-	// No existing cert found, do a first-time import
-	h.logger.Info("no existing cert found on FortiGate, importing fresh",
-		zap.String("cert_name", newCertName))
+	// Leaf is now on the FortiGate (via either path). Sync the intermediate
+	// CAs so strict TLS clients (Android OkHttp, Java TrustManager) get the
+	// full chain in the handshake. Best-effort: any failure here is logged
+	// but does not roll back the leaf import.
+	h.syncIntermediateCAs(ctx, certPEM)
+	return nil
+}
 
-	return h.client.ImportCertificate(ctx, newCertName, certPEM, keyPEM)
+// syncIntermediateCAs uploads every non-leaf CERTIFICATE block from certPEM
+// into FortiGate's CA store. CA names are derived from sha256(DER) so the
+// same intermediate maps to the same name on every renewal — combined with
+// ImportCACertificate's error -23 swallow, repeated calls are no-ops.
+func (h *Handler) syncIntermediateCAs(ctx context.Context, certPEM []byte) {
+	blocks, err := splitPEMChain(certPEM)
+	if err != nil {
+		h.logger.Warn("could not parse cert chain for intermediate sync",
+			zap.Error(err))
+		return
+	}
+	if len(blocks) < 2 {
+		return
+	}
+	for _, blk := range blocks[1:] {
+		sum := sha256.Sum256(blk.Bytes)
+		caName := fmt.Sprintf("chain_%s", hex.EncodeToString(sum[:8]))
+		if err := h.client.ImportCACertificate(ctx, caName, blk.Bytes); err != nil {
+			h.logger.Warn("intermediate CA import failed (continuing)",
+				zap.String("ca_name", caName),
+				zap.Error(err))
+		}
+	}
 }
 
 // matchesDomain checks if an identifier matches a list of domain patterns.

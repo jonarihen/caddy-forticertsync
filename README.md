@@ -105,6 +105,12 @@ example.com, *.example.com {
 
 Certificates are uploaded to FortiGate with a date-suffixed name to avoid in-place update issues. For example, a cert mapping with name `example_com` will be uploaded as `example_com_07052026` (format: `ddMMyyyy`). When a newer cert is synced, the old one is automatically replaced and any FortiGate objects that referenced it are rebound. The old cert is only deleted once zero references remain &mdash; rebind failures leave it in place so nothing breaks.
 
+## Intermediate CAs
+
+ACME `.crt` files typically contain the leaf plus one or more intermediate certificates. The plugin imports the leaf as a local certificate (under your configured cert mapping name) and each intermediate as a CA certificate named `chain_<8 hex chars>` (the first 8 hex chars of the SHA-256 of the intermediate's DER). Because the name is content-derived, the same intermediate maps to the same entry on every renewal &mdash; FortiGate's "entry already exists" response is treated as a no-op, so CA entries do not accumulate.
+
+This matters for strict TLS clients: browsers can fetch missing intermediates via AIA, but Android (OkHttp) and Java's `TrustManager` require the server to send the full chain in the handshake. FortiGate builds that chain by looking up the leaf's issuer in its CA store, so the intermediate must be present there for the chain to be complete.
+
 ## Troubleshooting
 
 Enable Caddy's debug logging to see detailed plugin activity:
@@ -120,6 +126,7 @@ Common issues:
 - **Certificate not found:** Ensure the `cert` name matches what exists on FortiGate (check System > Certificates)
 - **Connection refused:** Verify `fortigate_url` includes the correct HTTPS port
 - **`failed to read certificate file`:** The plugin resolves cert/key paths against `caddy.AppDataDir()`. If you've configured a custom Caddy storage root, the resolved path won't exist &mdash; see Requirements above.
+- **Android / Java clients fail with `Trust anchor for certification path not found`:** Verify with `openssl s_client -connect host:443 -showcerts < /dev/null | grep -c "BEGIN CERTIFICATE"` &mdash; you should see 2 (leaf + intermediate). If you see 1, check that a `chain_<hex>` entry exists under **System > Certificates > External CA Certificates** on the FortiGate. The plugin should create one automatically on each sync; if it's missing, look for `intermediate CA import failed` in Caddy's logs.
 
 ## Attribution
 
