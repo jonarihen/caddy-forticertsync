@@ -60,6 +60,24 @@ example.com, *.example.com {
 }
 ```
 
+### Sync-everything mode
+
+If you'd rather have every certificate Caddy issues land on the FortiGate without listing them one by one, set `sync_all` and drop the `cert` blocks:
+
+```caddyfile
+{
+    events {
+        on cert_obtained forticertsync {
+            fortigate_url https://192.168.1.1:4443
+            api_token {env.FORTIGATE_API_TOKEN}
+            sync_all
+        }
+    }
+}
+```
+
+Each identifier gets a FortiGate cert slot named `sanitizeName(identifier)` (e.g. `*.example.com` &rarr; `wildcard_example_com`). You can still add `cert` blocks alongside `sync_all` to override the auto-derived name for specific identifiers; explicit mappings always win.
+
 ### Configuration options
 
 | Option | Required | Description |
@@ -68,7 +86,8 @@ example.com, *.example.com {
 | `api_token` | yes | FortiGate REST API bearer token. Use `{env.VAR}` to load it from an environment variable &mdash; never paste the token literally. |
 | `vdom` | no | Target VDOM name. Omit if VDOMs are disabled. |
 | `insecure_skip_verify` | no | Disable TLS verification when talking to FortiGate. Common in homelabs that use a self-signed admin cert. |
-| `cert <name> { domains ... }` | yes (≥1) | Maps a FortiGate certificate slot name to one or more domain identifiers. Supports exact (`example.com`) and wildcard (`*.example.com`) matching. Repeat the block for multiple certs. |
+| `sync_all` | no | Sync every renewed certificate to FortiGate, even ones not covered by an explicit `cert` block. Auto-derived names follow `sanitizeName(identifier)` (lowercase, dots/dashes &rarr; underscores, `*.` &rarr; `wildcard_`). Explicit `cert` blocks still take precedence. When set, the `cert` block is optional. |
+| `cert <name> { domains ... }` | yes (≥1 unless `sync_all`) | Maps a FortiGate certificate slot name to one or more domain identifiers. Supports exact (`example.com`) and wildcard (`*.example.com`) matching. Repeat the block for multiple certs. |
 
 ## JSON Configuration
 

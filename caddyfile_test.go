@@ -78,6 +78,24 @@ func TestUnmarshalCaddyfile_Minimal(t *testing.T) {
 	}
 }
 
+func TestUnmarshalCaddyfile_SyncAll(t *testing.T) {
+	input := `forticertsync {
+		fortigate_url https://fw
+		api_token tok
+		sync_all
+	}`
+	h, err := parse(t, input)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !h.SyncAll {
+		t.Error("SyncAll should be true")
+	}
+	if len(h.Certificates) != 0 {
+		t.Errorf("expected zero certificate mappings, got %d", len(h.Certificates))
+	}
+}
+
 func TestUnmarshalCaddyfile_Errors(t *testing.T) {
 	tests := []struct {
 		name      string

@@ -46,6 +46,13 @@ type Handler struct {
 	// admin certificates.
 	InsecureSkipVerify bool `json:"insecure_skip_verify,omitempty"`
 
+	// SyncAll opts into syncing every cert_obtained event to FortiGate,
+	// even ones not covered by an explicit Certificates mapping. Unmapped
+	// identifiers get an auto-derived FortiGate cert name from
+	// sanitizeName(identifier). Default false (strict opt-in) to preserve
+	// existing behavior. Explicit mappings always take precedence.
+	SyncAll bool `json:"sync_all,omitempty"`
+
 	logger  *zap.Logger
 	client  *FortiGateClient
 	dataDir string
@@ -84,6 +91,25 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	// them with filepath.Join in Handle().
 	h.dataDir = caddy.AppDataDir()
 
+	// Warn on multi-non-wildcard mappings — each identifier ends up with
+	// its own FortiGate cert slot, but an SSL inspection profile can only
+	// bind one. Full coverage needs a single multi-SAN cert from Caddy.
+	for _, m := range h.Certificates {
+		nonWildcard := 0
+		for _, d := range m.Domains {
+			if !strings.HasPrefix(d, "*.") {
+				nonWildcard++
+			}
+		}
+		if nonWildcard >= 2 {
+			h.logger.Warn("mapping covers multiple non-wildcard domains; each domain will produce a separate FortiGate cert. "+
+				"SSL inspection profiles bind one cert at a time — to serve all names through one profile, "+
+				"configure Caddy to issue a single multi-SAN cert.",
+				zap.String("mapping_name", m.Name),
+				zap.Strings("domains", m.Domains))
+		}
+	}
+
 	h.client = NewFortiGateClient(h.FortiGateURL, h.APIToken, h.VDOM, h.InsecureSkipVerify, h.logger)
 	return nil
 }
@@ -96,8 +122,8 @@ func (h *Handler) Validate() error {
 	if h.APIToken == "" {
 		return fmt.Errorf("api_token is required")
 	}
-	if len(h.Certificates) == 0 {
-		return fmt.Errorf("at least one certificate mapping is required")
+	if len(h.Certificates) == 0 && !h.SyncAll {
+		return fmt.Errorf("at least one certificate mapping is required (or enable sync_all)")
 	}
 	for i, cert := range h.Certificates {
 		if cert.Name == "" {
@@ -158,19 +184,41 @@ func (h *Handler) Handle(ctx context.Context, e caddy.Event) error {
 	// Process each matching cert mapping. Per-mapping sync failures are logged
 	// but never returned: a FortiGate being unreachable must not block other
 	// Caddy event handlers, and one mapping failing should not skip the rest.
+	matched := false
 	for _, mapping := range h.Certificates {
 		if !matchesDomain(identifier, mapping.Domains) {
 			continue
 		}
+		matched = true
 
 		h.logger.Info("domain matches cert mapping",
 			zap.String("identifier", identifier),
 			zap.String("mapping_name", mapping.Name))
 
-		if err := h.syncCertToFortiGate(ctx, mapping, certPEM, keyPEM); err != nil {
+		if err := h.syncCertToFortiGate(ctx, mapping, identifier, certPEM, keyPEM); err != nil {
 			h.logger.Error("failed to sync cert to FortiGate",
 				zap.String("identifier", identifier),
 				zap.String("mapping_name", mapping.Name),
+				zap.Error(err))
+		}
+	}
+
+	// SyncAll fallback: no explicit mapping matched, synthesize one from
+	// the identifier so the cert still reaches the FortiGate. Auto-derived
+	// mappings have a single domain, so effectiveBaseName returns mapping.Name
+	// (the sanitized identifier) without further transformation.
+	if !matched && h.SyncAll {
+		auto := CertMapping{
+			Name:    sanitizeName(identifier),
+			Domains: []string{identifier},
+		}
+		h.logger.Info("no explicit mapping matched; sync_all auto-syncing",
+			zap.String("identifier", identifier),
+			zap.String("auto_name", auto.Name))
+		if err := h.syncCertToFortiGate(ctx, auto, identifier, certPEM, keyPEM); err != nil {
+			h.logger.Error("failed to sync cert to FortiGate (auto)",
+				zap.String("identifier", identifier),
+				zap.String("auto_name", auto.Name),
 				zap.Error(err))
 		}
 	}
@@ -179,9 +227,13 @@ func (h *Handler) Handle(ctx context.Context, e caddy.Event) error {
 }
 
 // syncCertToFortiGate handles the full sync lifecycle for a single cert mapping.
-func (h *Handler) syncCertToFortiGate(ctx context.Context, mapping CertMapping, certPEM, keyPEM []byte) error {
-	// Generate date-suffixed cert name
-	newCertName := fmt.Sprintf("%s_%s", mapping.Name, time.Now().Format("02012006"))
+func (h *Handler) syncCertToFortiGate(ctx context.Context, mapping CertMapping, identifier string, certPEM, keyPEM []byte) error {
+	// effectiveBaseName returns mapping.Name for the common case, but
+	// gives each identifier its own slot when a mapping covers multiple
+	// non-wildcard domains — otherwise two cert_obtained events for the
+	// same mapping race and the second overwrites the first.
+	baseName := effectiveBaseName(mapping, identifier)
+	newCertName := fmt.Sprintf("%s_%s", baseName, time.Now().Format("02012006"))
 
 	// Validate the new cert parses cleanly before any API calls.
 	if _, err := parsePEMCertificate(certPEM); err != nil {
@@ -189,10 +241,10 @@ func (h *Handler) syncCertToFortiGate(ctx context.Context, mapping CertMapping, 
 	}
 
 	// Find the current cert on FortiGate matching this mapping's name pattern
-	currentCert, err := h.client.GetCertificateByPattern(ctx, mapping.Name)
+	currentCert, err := h.client.GetCertificateByPattern(ctx, baseName)
 	if err != nil {
 		h.logger.Warn("could not retrieve current cert from FortiGate, will attempt fresh import",
-			zap.String("pattern", mapping.Name),
+			zap.String("pattern", baseName),
 			zap.Error(err))
 	}
 
@@ -279,6 +331,56 @@ func matchesDomain(identifier string, domains []string) bool {
 		}
 	}
 	return false
+}
+
+// sanitizeName converts a domain identifier into a FortiGate-safe cert name.
+// Rules: leading "*." becomes "wildcard_"; dots and dashes become underscores;
+// anything outside [a-z0-9_] is stripped; lowercase throughout. If the result
+// exceeds 31 characters (FortiGate's certname limit), it is truncated to
+// 23 chars and suffixed with "_" + first 7 hex of sha256(original) so distinct
+// long names don't collide.
+func sanitizeName(identifier string) string {
+	s := strings.ToLower(identifier)
+	if strings.HasPrefix(s, "*.") {
+		s = "wildcard_" + s[2:]
+	}
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '_':
+			b.WriteRune(r)
+		case r == '.' || r == '-':
+			b.WriteRune('_')
+		}
+	}
+	out := b.String()
+	if len(out) > 31 {
+		sum := sha256.Sum256([]byte(identifier))
+		out = out[:23] + "_" + hex.EncodeToString(sum[:])[:7]
+	}
+	return out
+}
+
+// effectiveBaseName picks the FortiGate cert base name for a single
+// cert_obtained event. Returns mapping.Name when the mapping is unambiguous
+// (0-1 domains, or all wildcards — those share one FortiGate cert slot).
+// Returns sanitizeName(identifier) when the mapping has 2+ non-wildcard
+// domains, so each identifier gets its own cert slot instead of racing on
+// the same name and overwriting each other.
+func effectiveBaseName(mapping CertMapping, identifier string) string {
+	if len(mapping.Domains) <= 1 {
+		return mapping.Name
+	}
+	nonWildcard := 0
+	for _, d := range mapping.Domains {
+		if !strings.HasPrefix(d, "*.") {
+			nonWildcard++
+		}
+	}
+	if nonWildcard <= 1 {
+		return mapping.Name
+	}
+	return sanitizeName(identifier)
 }
 
 // resolveStoragePath joins a Caddy storage key (a relative path emitted by

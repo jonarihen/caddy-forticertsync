@@ -46,6 +46,9 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 		case "insecure_skip_verify":
 			h.InsecureSkipVerify = true
 
+		case "sync_all":
+			h.SyncAll = true
+
 		case "cert":
 			if !d.NextArg() {
 				return d.ArgErr()
