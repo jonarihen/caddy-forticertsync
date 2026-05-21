@@ -322,7 +322,9 @@ func (c *FortiGateClient) ImportCACertificate(ctx context.Context, caName string
 }
 
 // isAlreadyExistsError returns true if the FortiGate response body
-// contains error code -23 ("entry already exists").
+// indicates the entry already exists. FortiOS uses -23 on the local cert
+// import endpoint and -328 on the CA cert import endpoint for the same
+// semantic outcome.
 func isAlreadyExistsError(body []byte) bool {
 	var errResp struct {
 		Error int `json:"error"`
@@ -330,7 +332,7 @@ func isAlreadyExistsError(body []byte) bool {
 	if err := json.Unmarshal(body, &errResp); err != nil {
 		return false
 	}
-	return errResp.Error == -23
+	return errResp.Error == -23 || errResp.Error == -328
 }
 
 // splitPEMChain returns every CERTIFICATE block from a PEM bundle in the

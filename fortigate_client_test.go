@@ -570,16 +570,28 @@ func TestImportCACertificate(t *testing.T) {
 }
 
 func TestImportCACertificate_AlreadyExists(t *testing.T) {
-	// Renewals re-import the same intermediate every time. FortiOS returns
-	// error -23, which we swallow so a renewal isn't a hard failure.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-		_, _ = io.WriteString(w, `{"error":-23,"status":"error"}`)
-	}))
-	defer srv.Close()
+	// Renewals re-import the same intermediate every time. The CA import
+	// endpoint returns error -328 (and historically -23) for that case; we
+	// swallow both so a renewal isn't a hard failure.
+	tests := []struct {
+		name string
+		body string
+	}{
+		{"-23", `{"error":-23,"status":"error"}`},
+		{"-328", `{"http_method":"POST","error":-328,"status":"error","http_status":500,"vdom":"root","path":"vpn-certificate","name":"ca","action":"import"}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = io.WriteString(w, tt.body)
+			}))
+			defer srv.Close()
 
-	c := newTestClient(t, srv, "")
-	if err := c.ImportCACertificate(context.Background(), "chain_abcd1234", []byte("DER")); err != nil {
-		t.Fatalf("ImportCACertificate with -23 should return nil, got %v", err)
+			c := newTestClient(t, srv, "")
+			if err := c.ImportCACertificate(context.Background(), "chain_abcd1234", []byte("DER")); err != nil {
+				t.Fatalf("ImportCACertificate with %s should return nil, got %v", tt.name, err)
+			}
+		})
 	}
 }
