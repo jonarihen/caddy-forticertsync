@@ -168,17 +168,57 @@ All calls use `Authorization: Bearer <token>`. Append `?vdom=<name>` if VDOM is 
 }
 ```
 
+## Inspection-bundle mode
+
+A FortiOS SSL/SSH inspection profile caps its inbound `server-cert` list at **10
+entries** (`serverCertMax` in `certname.go`). One-certificate-per-hostname syncing
+exhausts that, and FortiOS won't delete a certificate a profile still references,
+so the profile jams. `inspection_bundle` replaces the whole list with ONE
+multi-SAN certificate the plugin orders itself.
+
+- `bundle.go` — config structs (`InspectionBundle`, `BundleZone`), `Subjects()`,
+  `covers()`, issuance via `certmagic.ACMEIssuer.Issue(ctx, csr)`, on-disk cache,
+  and `state.json` (FortiGate cert base name → Caddy identifier).
+- `bundle_provision.go` — builds the ACME issuer from a `dns.providers.*` Caddy
+  module, starts/stops the renewal ticker.
+- `bundle_reconcile.go` — `reconcile()`, the single-PUT profile swap
+  (`bindProfile`), and `supersededNames()`.
+- `certname.go` — `serverCertMax`, `stripDateSuffix`, `chainCAName`.
+
+Three things here are load-bearing and must not be "simplified":
+
+1. **The profile swap is ONE PUT.** `bindProfile` computes `[bundle] + uncovered`
+   and writes it in a single request. Adding the bundle first and pruning after
+   needs an 11th slot on a full profile and is rejected — that is the exact
+   failure the feature exists to remove.
+2. **Coverage is proven, never inferred.** `sanitizeName` maps both `.` and `-`
+   to `_`, so `a-b.x.dk` (wildcard-covered) and `a.b.x.dk` (not) both become
+   `a_b_x_dk`. `supersededNames` therefore only trusts `state.json`, the names it
+   mints itself for a zone's apex/wildcard, and the explicit `supersede` list.
+   Unproven certificates stay attached — a wasted slot beats a broken site.
+3. **Bundle mode needs a timer.** Nothing else owns this certificate: it is not
+   Caddy-managed, and certmagic's renewal is one-certificate-per-name
+   (`Config.manageAll` iterates the name list), so it cannot drive a multi-SAN
+   cert. This is the documented exception to design decision 1 below.
+
+Wildcards require DNS-01, so every bundled zone needs credentials in the `dns`
+provider. Zones without them stay on per-domain syncing and keep their own slot;
+the two modes coexist. `Handle()` short-circuits any identifier `covers()`
+matches, which is what makes publishing a new subdomain cost zero FortiGate work.
+
 ## Key design decisions
 
-1. **Event-driven.** Only fires on `cert_obtained` events. No polling, no timers, no goroutines.
+1. **Event-driven.** Only fires on `cert_obtained` events. No polling, no timers, no goroutines. **Exception:** inspection-bundle mode runs a renewal ticker — see above for why it has no alternative.
 2. **Date-suffixed names.** New certs uploaded as `<name>_<ddMMyyyy>`. Avoids unreliable in-place updates.
 3. **Safe deletion.** Old cert only deleted after confirming zero remaining references.
 4. **Env var for API key.** Use `{env.FORTIGATE_API_TOKEN}` in Caddyfile. Never log the token.
 5. **Insecure TLS option.** For self-signed FortiGate admin certs (common in homelabs).
 6. **Graceful failure.** FortiGate sync errors are logged but don't crash Caddy. `Handle()` returns nil on non-fatal failures.
-7. **No external deps.** Only Caddy v2 + Go standard library.
+7. **No external deps.** Only Caddy v2 + Go standard library. Inspection-bundle mode uses `github.com/caddyserver/certmagic`, which is already in the tree as an indirect dependency of Caddy — no new module is added.
 
 ## Dependencies
 
 - `github.com/caddyserver/caddy/v2` (module system, events, caddyfile, zap logger)
+- `github.com/caddyserver/certmagic` (ACME issuer for inspection-bundle mode; comes in with Caddy)
+- A `dns.providers.*` module (e.g. `github.com/caddy-dns/cloudflare`) must be in the xcaddy build for bundle mode — it is what solves DNS-01
 - Go standard library: `crypto/x509`, `encoding/pem`, `encoding/json`, `net/http`, `crypto/tls`
