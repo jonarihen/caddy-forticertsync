@@ -379,6 +379,92 @@ func (c *FortiGateClient) DeleteCertificate(ctx context.Context, certName string
 	return nil
 }
 
+// GetProfileServerCerts reads the inbound server-certificate list from an
+// SSL/SSH inspection profile, in the order FortiOS stores it.
+func (c *FortiGateClient) GetProfileServerCerts(ctx context.Context, profileName string) ([]string, error) {
+	apiURL := c.buildURL(fmt.Sprintf("api/v2/cmdb/firewall/ssl-ssh-profile/%s", url.PathEscape(profileName)))
+
+	body, statusCode, err := c.doRequest(ctx, http.MethodGet, apiURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("fetching inspection profile %q: %w", profileName, err)
+	}
+	if statusCode != http.StatusOK {
+		return nil, fmt.Errorf("fetch inspection profile %q returned status %d: %s", profileName, statusCode, string(body))
+	}
+
+	value, err := extractFieldValueFromResults(body, "server-cert")
+	if err != nil {
+		// A profile that has never had a server certificate simply omits the
+		// field; an empty list is the correct reading, not an error.
+		return nil, nil
+	}
+	return certNamesFromValue(value), nil
+}
+
+// SetProfileServerCerts replaces an inspection profile's inbound
+// server-certificate list wholesale.
+//
+// The caller is responsible for the list contents; this refuses to send more
+// than serverCertMax entries so the cap surfaces as a clear Go error rather
+// than FortiOS's "attribute set operator error, -4".
+func (c *FortiGateClient) SetProfileServerCerts(ctx context.Context, profileName string, certNames []string) error {
+	if len(certNames) > serverCertMax {
+		return fmt.Errorf("refusing to set %d server certificates on %q: FortiOS allows at most %d",
+			len(certNames), profileName, serverCertMax)
+	}
+	if len(certNames) == 0 {
+		return fmt.Errorf("refusing to clear the server-certificate list on %q: that would disable inbound inspection", profileName)
+	}
+
+	entries := make([]map[string]string, 0, len(certNames))
+	for _, name := range certNames {
+		entries = append(entries, map[string]string{"name": name})
+	}
+
+	apiURL := c.buildURL(fmt.Sprintf("api/v2/cmdb/firewall/ssl-ssh-profile/%s", url.PathEscape(profileName)))
+	body, statusCode, err := c.doRequest(ctx, http.MethodPut, apiURL, map[string]interface{}{
+		"server-cert-mode": "replace",
+		"server-cert":      entries,
+	})
+	if err != nil {
+		return fmt.Errorf("updating inspection profile %q: %w", profileName, err)
+	}
+	if statusCode != http.StatusOK {
+		return fmt.Errorf("update inspection profile %q returned status %d: %s", profileName, statusCode, string(body))
+	}
+	return nil
+}
+
+// certNamesFromValue normalizes the two shapes FortiOS uses for a multi-value
+// certificate field: an array of objects, or a single space-separated string
+// of (sometimes quoted) names.
+func certNamesFromValue(val interface{}) []string {
+	var out []string
+	switch v := val.(type) {
+	case string:
+		for _, token := range strings.Fields(v) {
+			if name := strings.Trim(token, `"`); name != "" {
+				out = append(out, name)
+			}
+		}
+	case []interface{}:
+		for _, item := range v {
+			m, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			name, _ := m["name"].(string)
+			if name == "" {
+				name, _ = m["q_origin_key"].(string)
+			}
+			if name != "" {
+				out = append(out, name)
+			}
+		}
+	}
+	return out
+}
+
 // FindCertReferences queries known CMDB endpoints to find all objects
 // that reference the given certificate name.
 func (c *FortiGateClient) FindCertReferences(ctx context.Context, certName string) ([]CertReference, error) {

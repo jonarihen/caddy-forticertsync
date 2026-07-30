@@ -53,9 +53,19 @@ type Handler struct {
 	// existing behavior. Explicit mappings always take precedence.
 	SyncAll bool `json:"sync_all,omitempty"`
 
+	// Bundle enables inspection-bundle mode: instead of mirroring one Caddy
+	// certificate per hostname into the FortiGate (which exhausts the
+	// 10-per-profile server-certificate cap), the plugin maintains ONE
+	// multi-SAN certificate covering every configured zone. Identifiers the
+	// bundle covers are skipped by per-domain syncing, so both modes coexist:
+	// zones with DNS-01 credentials go in the bundle, everything else keeps
+	// its own certificate and slot.
+	Bundle *InspectionBundle `json:"inspection_bundle,omitempty"`
+
 	logger  *zap.Logger
 	client  *FortiGateClient
 	dataDir string
+	bundle  *bundleManager
 }
 
 // CertMapping maps a FortiGate certificate slot to one or more domain identifiers.
@@ -111,6 +121,20 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	}
 
 	h.client = NewFortiGateClient(h.FortiGateURL, h.APIToken, h.VDOM, h.InsecureSkipVerify, h.logger)
+
+	if h.Bundle.enabled() {
+		if err := h.provisionBundle(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Cleanup stops the bundle's renewal ticker on config reload/shutdown.
+func (h *Handler) Cleanup() error {
+	if h.bundle != nil {
+		h.bundle.stopTicker()
+	}
 	return nil
 }
 
@@ -122,12 +146,32 @@ func (h *Handler) Validate() error {
 	if h.APIToken == "" {
 		return fmt.Errorf("api_token is required")
 	}
-	if len(h.Certificates) == 0 && !h.SyncAll {
-		return fmt.Errorf("at least one certificate mapping is required (or enable sync_all)")
+	if len(h.Certificates) == 0 && !h.SyncAll && !h.Bundle.enabled() {
+		return fmt.Errorf("at least one certificate mapping is required (or enable sync_all, or configure an inspection_bundle)")
 	}
 	for i, cert := range h.Certificates {
 		if cert.Name == "" {
 			return fmt.Errorf("certificate mapping %d: name is required", i)
+		}
+	}
+	if h.Bundle != nil {
+		if h.Bundle.Name == "" {
+			return fmt.Errorf("inspection_bundle: name is required")
+		}
+		if len(h.Bundle.Zones) == 0 {
+			return fmt.Errorf("inspection_bundle %q: at least one zone is required", h.Bundle.Name)
+		}
+		if _, err := h.Bundle.Subjects(); err != nil {
+			return err
+		}
+		for i, z := range h.Bundle.Zones {
+			if strings.TrimSpace(z.Domain) == "" {
+				return fmt.Errorf("inspection_bundle %q: zone %d has no domain", h.Bundle.Name, i)
+			}
+			if strings.HasPrefix(z.Domain, "*.") {
+				return fmt.Errorf("inspection_bundle %q: zone %d should be the parent domain (%q), not a wildcard — "+
+					"use `wildcard off` to exclude the wildcard SAN", h.Bundle.Name, i, strings.TrimPrefix(z.Domain, "*."))
+			}
 		}
 	}
 	return nil
@@ -158,6 +202,18 @@ func (h *Handler) Handle(ctx context.Context, e caddy.Event) error {
 
 	h.logger.Info("received cert_obtained event",
 		zap.String("identifier", identifier))
+
+	// Bundle mode: if the inspection bundle's SAN list already covers this
+	// name, the FortiGate needs nothing. This is what makes publishing a new
+	// site free — Homelabrrr pushes a route, Caddy issues a certificate for
+	// serving, and because "*.example.com" is already in the bundle, no new
+	// FortiGate certificate and no new profile slot are involved.
+	if h.bundle != nil && h.Bundle.covers(identifier) {
+		h.logger.Info("identifier is covered by the inspection bundle; no per-domain sync needed",
+			zap.String("identifier", identifier),
+			zap.String("bundle", h.Bundle.Name))
+		return nil
+	}
 
 	certFullPath := resolveStoragePath(h.dataDir, certPath)
 	keyFullPath := resolveStoragePath(h.dataDir, keyPath)
@@ -235,6 +291,13 @@ func (h *Handler) syncCertToFortiGate(ctx context.Context, mapping CertMapping, 
 	baseName := effectiveBaseName(mapping, identifier)
 	newCertName := fmt.Sprintf("%s_%s", baseName, time.Now().Format("02012006"))
 
+	// Record which identifier this FortiGate name stands for. Bundle migration
+	// uses this to prove a certificate is superseded rather than inferring it
+	// from the name, which is not reversible (see supersededNames).
+	if h.bundle != nil {
+		h.bundle.recordManaged(baseName, identifier)
+	}
+
 	// Validate the new cert parses cleanly before any API calls.
 	if _, err := parsePEMCertificate(certPEM); err != nil {
 		return fmt.Errorf("parsing new certificate: %w", err)
@@ -301,8 +364,7 @@ func (h *Handler) syncIntermediateCAs(ctx context.Context, certPEM []byte) {
 		return
 	}
 	for _, blk := range blocks[1:] {
-		sum := sha256.Sum256(blk.Bytes)
-		caName := fmt.Sprintf("chain_%s", hex.EncodeToString(sum[:8]))
+		caName := chainCAName(blk.Bytes)
 		if err := h.client.ImportCACertificate(ctx, caName, blk.Bytes); err != nil {
 			h.logger.Warn("intermediate CA import failed (continuing)",
 				zap.String("ca_name", caName),

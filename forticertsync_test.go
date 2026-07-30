@@ -247,11 +247,11 @@ func TestResolveStoragePath(t *testing.T) {
 // handleTestFixture sets up a temp data dir with valid cert/key files
 // and a mock FortiGate that records every /local/import certname.
 type handleTestFixture struct {
-	server        *httptest.Server
-	dataDir       string
+	server         *httptest.Server
+	dataDir        string
 	certStorageKey string
 	keyStorageKey  string
-	importedNames []string
+	importedNames  []string
 }
 
 func newHandleTestFixture(t *testing.T) *handleTestFixture {
