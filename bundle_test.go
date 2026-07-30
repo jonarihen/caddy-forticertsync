@@ -1,6 +1,7 @@
 package forticertsync
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -263,4 +264,45 @@ func TestBundleDefaultsAreSane(t *testing.T) {
 	if time.Duration(d) != defaultBundleRenewBefore {
 		t.Error("caddy.Duration round-trip failed")
 	}
+}
+
+// stopTicker must interrupt a reconcile already in flight, not just signal the
+// tick loop. Regression for "bundle worker did not stop within 10s" seen on a
+// config reload while an ACME order was running.
+func TestStopTickerCancelsInFlightWork(t *testing.T) {
+	baseCtx, cancelWork := context.WithCancel(context.Background())
+	m := &bundleManager{
+		cfg:        homelabBundle(),
+		logger:     zap.NewNop(),
+		baseCtx:    baseCtx,
+		cancelWork: cancelWork,
+		stop:       make(chan struct{}),
+		done:       make(chan struct{}),
+	}
+
+	entered := make(chan struct{})
+	go func() {
+		defer close(m.done)
+		close(entered)
+		// Stand in for a long ACME order: only baseCtx cancellation ends it.
+		<-m.baseCtx.Done()
+	}()
+	<-entered
+
+	start := time.Now()
+	m.stopTicker()
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("stopTicker took %v — it waited out the timeout instead of cancelling", elapsed)
+	}
+	if m.baseCtx.Err() == nil {
+		t.Error("baseCtx should be cancelled after stopTicker")
+	}
+	select {
+	case <-m.stop:
+	default:
+		t.Error("stop channel should be closed")
+	}
+
+	// Idempotent: Caddy can call Cleanup more than once.
+	m.stopTicker()
 }

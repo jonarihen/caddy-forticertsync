@@ -62,14 +62,17 @@ func (h *Handler) provisionBundle(ctx caddy.Context) error {
 		template.TestCA = b.CA
 	}
 
+	baseCtx, cancelWork := context.WithCancel(context.Background())
 	h.bundle = &bundleManager{
-		cfg:     b,
-		client:  h.client,
-		logger:  h.logger.With(zap.String("bundle", b.Name)),
-		dataDir: h.dataDir,
-		issuer:  certmagic.NewACMEIssuer(cfg, template),
-		stop:    make(chan struct{}),
-		done:    make(chan struct{}),
+		cfg:        b,
+		client:     h.client,
+		logger:     h.logger.With(zap.String("bundle", b.Name)),
+		dataDir:    h.dataDir,
+		issuer:     certmagic.NewACMEIssuer(cfg, template),
+		baseCtx:    baseCtx,
+		cancelWork: cancelWork,
+		stop:       make(chan struct{}),
+		done:       make(chan struct{}),
 	}
 	h.bundle.loadState()
 
@@ -124,11 +127,22 @@ func (m *bundleManager) startTicker() {
 	}()
 }
 
+// stopTicker ends the worker and interrupts any reconcile already running.
+//
+// Cancelling baseCtx is the part that matters: an ACME order takes tens of
+// seconds (minutes if DNS propagation is slow), and the worker only checks
+// `stop` between ticks — never from inside reconcile. Signalling the channel
+// alone left a config reload waiting the full 10s and then continuing with the
+// old reconcile still in flight, free to race the new instance's writes to the
+// same FortiGate profile.
 func (m *bundleManager) stopTicker() {
 	select {
 	case <-m.stop: // already closed
 	default:
 		close(m.stop)
+	}
+	if m.cancelWork != nil {
+		m.cancelWork()
 	}
 	select {
 	case <-m.done:
@@ -140,9 +154,16 @@ func (m *bundleManager) stopTicker() {
 // reconcileLogged runs a reconcile and swallows the error after logging it.
 // A FortiGate or ACME failure must never take Caddy down.
 func (m *bundleManager) reconcileLogged(reason string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	ctx, cancel := context.WithTimeout(m.baseCtx, 10*time.Minute)
 	defer cancel()
 	if err := m.reconcile(ctx, reason); err != nil {
+		// A shutdown-cancelled reconcile is expected, not a failure worth
+		// an error-level log on every config reload.
+		if m.baseCtx.Err() != nil {
+			m.logger.Info("inspection bundle reconcile interrupted by shutdown",
+				zap.String("reason", reason))
+			return
+		}
 		m.logger.Error("inspection bundle reconcile failed",
 			zap.String("reason", reason), zap.Error(err))
 	}

@@ -136,6 +136,13 @@ type bundleManager struct {
 	mu    sync.Mutex // serializes reconcile; the ticker and events both call it
 	state bundleState
 
+	// baseCtx is cancelled by stopTicker so a reconcile already in flight is
+	// interrupted. Without it, shutdown blocks until an ACME order finishes:
+	// the worker only observes `stop` between ticks, never from inside
+	// reconcile, which can take minutes.
+	baseCtx    context.Context
+	cancelWork context.CancelFunc
+
 	stop chan struct{}
 	done chan struct{}
 }
