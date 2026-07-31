@@ -38,12 +38,22 @@ func (m *bundleManager) reconcile(ctx context.Context, reason string) error {
 	}
 
 	leaf, certPEM, keyPEM := m.loadCached()
+	wantCA := m.cfg.effectiveCA()
 	needIssue := false
 	switch {
 	case leaf == nil:
 		needIssue = true
 		m.logger.Info("no cached bundle certificate, ordering one",
 			zap.String("bundle", m.cfg.Name), zap.String("reason", reason))
+	case m.loadMeta() != wantCA:
+		// The configured CA changed (e.g. staging removed to go live). Expiry
+		// and SAN set are unchanged, so nothing else here would notice, and the
+		// old certificate would go on being pushed forever.
+		needIssue = true
+		m.logger.Info("configured CA changed, re-ordering bundle",
+			zap.String("bundle", m.cfg.Name),
+			zap.String("cached_ca", m.loadMeta()),
+			zap.String("configured_ca", wantCA))
 	case !sanMatches(leaf, subjects):
 		needIssue = true
 		m.logger.Info("bundle SAN set changed, re-ordering",
@@ -67,12 +77,25 @@ func (m *bundleManager) reconcile(ctx context.Context, reason string) error {
 			// be pushed — but it means the next run re-orders needlessly.
 			m.logger.Error("could not cache bundle certificate; the next check will re-order",
 				zap.Error(err))
+		} else if err := m.saveMeta(wantCA); err != nil {
+			m.logger.Error("could not record the issuing CA; the next check will re-order",
+				zap.Error(err))
 		}
 		leaf, err = parsePEMCertificate(certPEM)
 		if err != nil {
 			return fmt.Errorf("parsing freshly issued bundle: %w", err)
 		}
 	}
+
+	// HARD GATE. In "Protecting SSL Server" mode the FortiGate presents this
+	// certificate to every visitor of every bundled domain. If it does not
+	// chain to a publicly trusted root, binding it takes all of them down with
+	// "unable to get local issuer certificate".
+	//
+	// This is not hypothetical: a staging certificate reached a live profile
+	// exactly this way, and staging is the normal way to test the feature.
+	// Importing is still useful for a dry run — binding is what must not happen.
+	trusted := verifyPubliclyTrusted(certPEM, time.Now()) == nil
 
 	// The FortiGate object name carries the issue date, so a renewal always
 	// lands under a new name and the swap below is a genuine replacement.
@@ -101,6 +124,20 @@ func (m *bundleManager) reconcile(ctx context.Context, reason string) error {
 	} else if !needIssue {
 		m.logger.Debug("bundle already current on FortiGate",
 			zap.String("cert_name", newName))
+	}
+
+	if !trusted {
+		hint := ""
+		if looksLikeStagingCA(wantCA) {
+			hint = " Remove the staging `ca` line to issue a real certificate."
+		}
+		m.logger.Error("bundle certificate is NOT publicly trusted — imported but NOT bound to any profile. "+
+			"Binding it would make every bundled domain fail with \"unable to get local issuer certificate\"."+hint,
+			zap.String("bundle", m.cfg.Name),
+			zap.String("cert_name", newName),
+			zap.String("ca", wantCA),
+			zap.Error(verifyPubliclyTrusted(certPEM, time.Now())))
+		return nil
 	}
 
 	if m.cfg.Profile == "" {
